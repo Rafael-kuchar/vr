@@ -11,8 +11,8 @@ android {
         applicationId = "com.vrhands.bridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1-beta"
+        versionCode = 3
+        versionName = "0.3-beta"
     }
 
     buildTypes {
@@ -31,6 +31,4 @@ android {
 
 dependencies {
     implementation("com.google.ar:core:1.44.0")
-    implementation("androidx.media3:media3-exoplayer:1.3.1")
-    implementation("androidx.media3:media3-ui:1.3.1")
 }
