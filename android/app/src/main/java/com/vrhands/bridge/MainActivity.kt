@@ -49,6 +49,9 @@ import java.util.Collections
  *   - ARCore 6DOF head tracking  -> UDP to relay.py on the PC (port 6000)
  *   - camera as MJPEG server     -> http://PHONE:8080/video (for hands.py, replaces IP Webcam)
  *   - receives the game video    <- UDP from the PC (port 5000, H.264 in MPEG-TS), shown fullscreen (side-by-side)
+ *
+ * v0.2: the camera server starts when the app opens, every step and every error is written to a log
+ * on the screen (and at http://PHONE:8080/ in the PC browser). Tap the screen to hide/show the log.
  */
 class MainActivity : Activity() {
 
@@ -63,7 +66,8 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private lateinit var setupPanel: LinearLayout
     private lateinit var ipField: EditText
-    private lateinit var statusView: TextView
+    private lateinit var infoView: TextView
+    private lateinit var logView: TextView
 
     private var glView: GLSurfaceView? = null
     private var player: ExoPlayer? = null
@@ -71,49 +75,93 @@ class MainActivity : Activity() {
     private var poseSender: PoseSender? = null
     private var mjpeg: MjpegServer? = null
 
-    private var started = false
+    @Volatile private var started = false
     private var arActive = false
     private var installRequested = false
     private var pcIp = ""
+    private var logVisible = true
+
+    private val startTime = System.currentTimeMillis()
+    private val logLines = ArrayList<String>()
+    @Volatile private var statusLine = ""
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
         if (Build.VERSION.SDK_INT >= 28) {
-            window.attributes.layoutInDisplayCutoutMode =
-                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            val lp = window.attributes
+            lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            window.attributes = lp
         }
         buildUi()
         hideSystemUi()
+        log("App aberto (v0.2). Celular: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}")
+        startServer()
+        log("Abra no navegador do PC: http://${bestIp()}:$CAMERA_PORT/  (tem que aparecer o status)")
     }
 
+    // ---------------- log ----------------
+    private fun log(msg: String) {
+        val sec = (System.currentTimeMillis() - startTime) / 1000
+        synchronized(logLines) {
+            logLines.add("[${sec}s] $msg")
+            while (logLines.size > 80) logLines.removeAt(0)
+        }
+        runOnUiThread { refreshLog() }
+    }
+
+    private fun setStatus(msg: String) {
+        statusLine = msg
+        runOnUiThread { refreshLog() }
+    }
+
+    private fun refreshLog() {
+        val lines = synchronized(logLines) { logLines.takeLast(9).joinToString("\n") }
+        logView.text = if (statusLine.isEmpty()) lines else statusLine + "\n" + lines
+    }
+
+    private fun fullLog(): String {
+        return synchronized(logLines) { logLines.joinToString("\n") }
+    }
+
+    private fun statusPage(): String {
+        val sb = StringBuilder()
+        sb.append("VR Phone Bridge - servidor da camera OK\n")
+        sb.append("Camera p/ hands.py: /video     Foto: /shot.jpg\n\n")
+        sb.append("Estado: ").append(if (started) "iniciado" else "aguardando o botao Iniciar no celular").append("\n")
+        sb.append(statusLine).append("\n\n")
+        sb.append(fullLog()).append("\n")
+        return sb.toString()
+    }
+
+    // ---------------- UI ----------------
     private fun buildUi() {
         root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
 
-        statusView = TextView(this).apply {
+        logView = TextView(this).apply {
             setTextColor(Color.rgb(120, 255, 120))
-            textSize = 10f
-            setPadding(16, 6, 16, 6)
+            setBackgroundColor(Color.argb(170, 0, 0, 0))
+            textSize = 11f
+            setPadding(120, 24, 120, 24)
         }
 
         setupPanel = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
+            gravity = Gravity.CENTER_HORIZONTAL
             setPadding(48, 24, 48, 24)
         }
         val title = TextView(this).apply {
-            text = "VR Phone Bridge  (beta)"
-            textSize = 22f
+            text = "VR Phone Bridge  (beta 0.2)"
+            textSize = 20f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
         }
-        val info = TextView(this).apply {
-            text = "IP deste celular: ${localIps()}\n" +
-                "No PC: python hands.py http://${localIps().split(", ").firstOrNull() ?: "IP"}:$CAMERA_PORT/video"
-            textSize = 13f
+        infoView = TextView(this).apply {
+            textSize = 12f
             setTextColor(Color.LTGRAY)
-            setPadding(0, 12, 0, 12)
+            setPadding(0, 8, 0, 8)
         }
+        refreshInfo()
         ipField = EditText(this).apply {
             hint = "IP do PC (ex: 192.168.1.10)"
             inputType = InputType.TYPE_CLASS_TEXT
@@ -127,15 +175,40 @@ class MainActivity : Activity() {
             setOnClickListener { onStartClicked() }
         }
         setupPanel.addView(title)
-        setupPanel.addView(info)
+        setupPanel.addView(infoView)
         setupPanel.addView(ipField, LinearLayout.LayoutParams(900, ViewGroup.LayoutParams.WRAP_CONTENT))
         setupPanel.addView(start, LinearLayout.LayoutParams(500, ViewGroup.LayoutParams.WRAP_CONTENT))
 
-        root.addView(setupPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
-        root.addView(statusView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP or Gravity.START))
+        root.addView(setupPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
+        root.addView(logView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        root.setOnClickListener {
+            if (started) {
+                logVisible = !logVisible
+                logView.visibility = if (logVisible) View.VISIBLE else View.GONE
+            }
+        }
         setContentView(root)
     }
 
+    private fun refreshInfo() {
+        val ip = bestIp()
+        val all = ipList().joinToString("   ") { "${it.first}: ${it.second}" }
+        infoView.text = "IP do celular no Wi-Fi: $ip     (todos: ${if (all.isEmpty()) "nenhum, esta no Wi-Fi?" else all})\n" +
+            "Teste no navegador do PC: http://$ip:$CAMERA_PORT/\n" +
+            "No PC: python hands.py http://$ip:$CAMERA_PORT/video"
+    }
+
+    // ---------------- camera server (starts with the app) ----------------
+    private fun startServer() {
+        if (mjpeg != null) return
+        val s = MjpegServer(CAMERA_PORT)
+        s.log = { m -> log(m) }
+        s.statusText = { statusPage() }
+        mjpeg = s
+        s.start()
+    }
+
+    // ---------------- start button ----------------
     private fun onStartClicked() {
         val ip = ipField.text.toString().trim()
         if (ip.isEmpty()) {
@@ -145,6 +218,7 @@ class MainActivity : Activity() {
         getSharedPreferences("cfg", MODE_PRIVATE).edit().putString("pc_ip", ip).apply()
         pcIp = ip
         if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
+            log("Pedindo permissao da camera...")
             requestPermissions(arrayOf(Manifest.permission.CAMERA), REQ_CAMERA)
         } else {
             startAll()
@@ -155,8 +229,10 @@ class MainActivity : Activity() {
         super.onRequestPermissionsResult(requestCode, permissions, grantResults)
         if (requestCode == REQ_CAMERA) {
             if (grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                log("Permissao da camera: OK")
                 startAll()
             } else {
+                log("Permissao da camera NEGADA. Sem ela o 6DOF e a camera nao funcionam.")
                 Toast.makeText(this, "Sem permissao de camera o 6DOF nao funciona", Toast.LENGTH_LONG).show()
             }
         }
@@ -166,16 +242,21 @@ class MainActivity : Activity() {
         if (started) return
         started = true
         setupPanel.visibility = View.GONE
+        log("Iniciando. PC = $pcIp (pose na porta $POSE_PORT)")
 
         val sender = PoseSender(pcIp, POSE_PORT)
-        val server = MjpegServer(CAMERA_PORT).also { it.start() }
         poseSender = sender
+        val server = mjpeg ?: MjpegServer(CAMERA_PORT).also { it.start() }
         mjpeg = server
 
-        val t = ArTracker(this, sender, server) { msg -> runOnUiThread { statusView.text = msg } }
+        val t = ArTracker(this, sender, server, { msg -> setStatus(msg) }, { msg -> log(msg) })
         tracker = t
 
-        startPlayer()
+        try {
+            startPlayer()
+        } catch (e: Exception) {
+            log("Video do jogo nao iniciou: ${e.javaClass.simpleName}: ${e.message}")
+        }
 
         val gl = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
@@ -183,9 +264,9 @@ class MainActivity : Activity() {
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
         glView = gl
-        root.addView(gl, FrameLayout.LayoutParams(2, 2, Gravity.BOTTOM or Gravity.END))
+        root.addView(gl, FrameLayout.LayoutParams(64, 64, Gravity.BOTTOM or Gravity.END))
 
-        statusView.text = "Iniciando ARCore..."
+        log("Iniciando ARCore...")
         resumeAr()
     }
 
@@ -195,18 +276,24 @@ class MainActivity : Activity() {
         if (arActive) return
         try {
             if (t.session == null) {
+                val avail = ArCoreApk.getInstance().checkAvailability(this)
+                log("ARCore: disponibilidade = ${avail.name}")
                 when (ArCoreApk.getInstance().requestInstall(this, !installRequested)) {
                     ArCoreApk.InstallStatus.INSTALL_REQUESTED -> {
                         installRequested = true
+                        log("ARCore: abrindo a instalacao/atualizacao (Play Store). Volte ao app depois.")
                         return                      // the install screen opens; onResume calls this again
                     }
                     ArCoreApk.InstallStatus.INSTALLED -> {}
                 }
+                log("ARCore: instalado, criando a sessao...")
                 t.createSession()
+                log("ARCore: sessao criada")
             }
             t.resumeSession()
             glView?.onResume()
             arActive = true
+            log("ARCore: sessao ligada (camera aberta)")
         } catch (e: UnavailableUserDeclinedInstallationException) {
             showError("Instale o 'Servicos do Google Play para RA' (ARCore) para usar o 6DOF.")
         } catch (e: UnavailableArcoreNotInstalledException) {
@@ -216,13 +303,13 @@ class MainActivity : Activity() {
         } catch (e: CameraNotAvailableException) {
             showError("Camera em uso por outro app (IP Webcam, Iriun...). Feche e reabra.")
         } catch (e: Exception) {
-            showError("Erro ao iniciar o ARCore: ${e.message}")
+            showError("Erro ao iniciar o ARCore: ${e.javaClass.simpleName}: ${e.message}")
         }
     }
 
     private fun showError(msg: String) {
-        statusView.text = msg
-        statusView.setTextColor(Color.rgb(255, 120, 120))
+        log("ERRO: $msg")
+        runOnUiThread { logView.setTextColor(Color.rgb(255, 130, 130)) }
     }
 
     // ---------------- game video (UDP, H.264 in MPEG-TS) ----------------
@@ -244,6 +331,7 @@ class MainActivity : Activity() {
         root.addView(pv, 0, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         player = p
         prepareVideo(p)
+        log("Video do jogo: esperando em udp porta $VIDEO_PORT (so aparece quando o PC mandar)")
     }
 
     @OptIn(UnstableApi::class)
@@ -264,6 +352,7 @@ class MainActivity : Activity() {
     override fun onResume() {
         super.onResume()
         hideSystemUi()
+        refreshInfo()
         if (started) {
             resumeAr()
             player?.playWhenReady = true
@@ -301,15 +390,32 @@ class MainActivity : Activity() {
             or View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN)
     }
 
-    private fun localIps(): String {
-        return try {
-            val list = Collections.list(NetworkInterface.getNetworkInterfaces() ?: return "?")
-            list.flatMap { Collections.list(it.inetAddresses) }
-                .filter { !it.isLoopbackAddress && it is Inet4Address }
-                .joinToString(", ") { it.hostAddress ?: "" }
-                .ifEmpty { "(sem Wi-Fi?)" }
+    /** (interface name, IPv4) of every active network interface */
+    private fun ipList(): List<Pair<String, String>> {
+        val out = ArrayList<Pair<String, String>>()
+        try {
+            val ifaces = NetworkInterface.getNetworkInterfaces()
+            if (ifaces != null) {
+                for (ni in Collections.list(ifaces)) {
+                    if (!ni.isUp || ni.isLoopback) continue
+                    for (a in Collections.list(ni.inetAddresses)) {
+                        if (a is Inet4Address && !a.isLoopbackAddress) {
+                            out.add(Pair(ni.name, a.hostAddress ?: ""))
+                        }
+                    }
+                }
+            }
         } catch (e: Exception) {
-            "?"
         }
+        return out
+    }
+
+    /** the Wi-Fi address (wlan0), not the mobile-data one */
+    private fun bestIp(): String {
+        val l = ipList()
+        val pick = l.firstOrNull { it.first.startsWith("wlan") }
+            ?: l.firstOrNull { it.first.startsWith("eth") || it.first.startsWith("ap") }
+            ?: l.firstOrNull()
+        return pick?.second ?: "IP_DO_CELULAR"
     }
 }

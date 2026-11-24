@@ -1,6 +1,7 @@
 package com.vrhands.bridge
 
 import java.io.BufferedOutputStream
+import java.net.InetSocketAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.TimeUnit
@@ -10,7 +11,11 @@ import kotlin.concurrent.withLock
 /**
  * Serves the camera as MJPEG over HTTP, the same way "IP Webcam" does:
  *   http://PHONE_IP:8080/video   (stream)      http://PHONE_IP:8080/shot.jpg   (one picture)
+ *   http://PHONE_IP:8080/        (status page: open it in the PC browser to test the connection)
  * hands.py can use it as is:  python hands.py http://PHONE_IP:8080/video
+ *
+ * The server starts as soon as the app opens (it does not wait for ARCore), and reports every
+ * problem (port busy, etc.) through [log], so nothing fails silently any more.
  */
 class MjpegServer(private val port: Int) {
     private val lock = ReentrantLock()
@@ -19,19 +24,31 @@ class MjpegServer(private val port: Int) {
     private var frameId = 0L
 
     @Volatile private var running = false
-    private var server: ServerSocket? = null
 
+    /** number of hands.py (or browser) connections currently watching /video */
     @Volatile var clients = 0
         private set
 
+    @Volatile var listening = false
+        private set
+
+    @Volatile var requests = 0
+        private set
+
+    /** set by the activity: where problems/events are reported, and the text shown at "/" */
+    @Volatile var log: (String) -> Unit = { }
+    @Volatile var statusText: () -> String = { "" }
+
     fun start() {
+        if (running) return
         running = true
-        Thread({ acceptLoop() }, "mjpeg-accept").apply { isDaemon = true }.start()
+        val t = Thread({ acceptLoop() }, "mjpeg-accept")
+        t.isDaemon = true
+        t.start()
     }
 
     fun stop() {
         running = false
-        try { server?.close() } catch (_: Exception) {}
         lock.withLock { newFrame.signalAll() }
     }
 
@@ -44,18 +61,48 @@ class MjpegServer(private val port: Int) {
     }
 
     private fun acceptLoop() {
-        try {
-            server = ServerSocket(port).apply { reuseAddress = true }
-        } catch (e: Exception) {
-            return
-        }
+        var lastError = ""
         while (running) {
+            var ss: ServerSocket? = null
             try {
-                val c = server!!.accept()
-                Thread({ serve(c) }, "mjpeg-client").apply { isDaemon = true }.start()
+                val tmp = ServerSocket()
+                tmp.reuseAddress = true
+                tmp.bind(InetSocketAddress(port))
+                ss = tmp
             } catch (e: Exception) {
-                if (!running) return
+                val msg = "${e.javaClass.simpleName}: ${e.message}"
+                if (msg != lastError) {
+                    log("Servidor da camera NAO subiu na porta $port ($msg). Tentando de novo...")
+                    lastError = msg
+                }
             }
+            val sock = ss
+            if (sock == null) {
+                listening = false
+                try { Thread.sleep(2000) } catch (_: InterruptedException) { }
+                continue
+            }
+            lastError = ""
+            listening = true
+            log("Servidor da camera ligado (porta $port)")
+            if (!running) {
+                try { sock.close() } catch (_: Exception) { }
+                break
+            }
+            while (running) {
+                try {
+                    val c = sock.accept()
+                    requests++
+                    val t = Thread({ serve(c) }, "mjpeg-client")
+                    t.isDaemon = true
+                    t.start()
+                } catch (e: Exception) {
+                    if (running) log("Servidor da camera: erro ao aceitar conexao (${e.javaClass.simpleName}: ${e.message})")
+                    break
+                }
+            }
+            listening = false
+            try { sock.close() } catch (_: Exception) { }
         }
     }
 
@@ -67,22 +114,24 @@ class MjpegServer(private val port: Int) {
     }
 
     private fun serve(s: Socket) {
-        clients++
+        var counted = false
         try {
             s.tcpNoDelay = true
+            s.soTimeout = 5000                   // only while reading the request
             val reader = s.getInputStream().bufferedReader()
             val requestLine = reader.readLine() ?: return
             while (true) {                       // skip the headers
                 val l = reader.readLine() ?: break
                 if (l.isEmpty()) break
             }
+            s.soTimeout = 0
             val path = requestLine.split(" ").getOrNull(1) ?: "/"
             val out = BufferedOutputStream(s.getOutputStream())
 
             if (path.startsWith("/shot")) {
                 val f = jpeg
                 if (f == null) {
-                    out.write("HTTP/1.0 503 Service Unavailable\r\n\r\n".toByteArray())
+                    out.write("HTTP/1.0 503 Service Unavailable\r\n\r\nsem imagem da camera ainda\n".toByteArray())
                 } else {
                     out.write("HTTP/1.0 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: ${f.size}\r\n\r\n".toByteArray())
                     out.write(f)
@@ -91,16 +140,20 @@ class MjpegServer(private val port: Int) {
                 return
             }
             if (!path.startsWith("/video")) {
-                val body = "VR Phone Bridge camera. Stream: /video   Picture: /shot.jpg\n"
-                out.write("HTTP/1.0 200 OK\r\nContent-Type: text/plain\r\nContent-Length: ${body.length}\r\n\r\n$body".toByteArray())
+                val body = statusText().toByteArray(Charsets.UTF_8)
+                out.write("HTTP/1.0 200 OK\r\nContent-Type: text/plain; charset=utf-8\r\nContent-Length: ${body.size}\r\n\r\n".toByteArray())
+                out.write(body)
                 out.flush()
                 return
             }
 
+            clients++
+            counted = true
             out.write(
                 ("HTTP/1.0 200 OK\r\nCache-Control: no-cache\r\nPragma: no-cache\r\nConnection: close\r\n" +
                     "Content-Type: multipart/x-mixed-replace; boundary=frame\r\n\r\n").toByteArray()
             )
+            out.flush()
             var last = -1L
             while (running) {
                 val (id, frame) = waitFrame(last)
@@ -114,8 +167,8 @@ class MjpegServer(private val port: Int) {
         } catch (_: Exception) {
             // client left
         } finally {
-            clients--
-            try { s.close() } catch (_: Exception) {}
+            if (counted) clients--
+            try { s.close() } catch (_: Exception) { }
         }
     }
 }

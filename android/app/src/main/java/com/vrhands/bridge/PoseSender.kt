@@ -22,6 +22,11 @@ class PoseSender(private val host: String, private val port: Int) {
     )
     private var address: InetAddress? = null
     private var seq = 0
+
+    @Volatile var sentCount = 0
+        private set
+    @Volatile var lastError = ""
+        private set
     private val buf = ByteBuffer.allocate(40).order(ByteOrder.LITTLE_ENDIAN)
 
     fun send(x: Float, y: Float, z: Float, qx: Float, qy: Float, qz: Float, qw: Float, tracking: Boolean) {
@@ -35,8 +40,10 @@ class PoseSender(private val host: String, private val port: Int) {
                 buf.putFloat(qx).putFloat(qy).putFloat(qz).putFloat(qw)
                 buf.putInt(if (tracking) 1 else 0)
                 socket.send(DatagramPacket(buf.array(), 40, address, port))
-            } catch (_: Exception) {
-                // PC not reachable yet: ignore, the next packet tries again
+                sentCount++
+            } catch (e: Exception) {
+                // PC not reachable yet: remember why, the next packet tries again
+                lastError = "${e.javaClass.simpleName}: ${e.message}"
             }
         }
     }

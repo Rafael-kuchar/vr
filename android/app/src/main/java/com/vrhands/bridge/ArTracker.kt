@@ -28,7 +28,8 @@ class ArTracker(
     private val activity: Activity,
     private val poseSender: PoseSender,
     private val mjpeg: MjpegServer,
-    private val onStatus: (String) -> Unit
+    private val onStatus: (String) -> Unit,
+    private val onLog: (String) -> Unit
 ) : GLSurfaceView.Renderer {
 
     @Volatile var session: Session? = null
@@ -43,6 +44,8 @@ class ArTracker(
     private var lastJpegKb = 0
     private var fovText = ""
     private var failedCamera = false
+    private var firstFrame = false
+    private val seenErrors = HashMap<String, Long>()
 
     /** Creates and configures the session (call from the main thread, after ARCore is installed). */
     fun createSession() {
@@ -70,6 +73,7 @@ class ArTracker(
 
     // ---------------- GLSurfaceView.Renderer ----------------
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
+        onLog("GL: superficie criada")
         GLES20.glClearColor(0f, 0f, 0f, 1f)
         val tex = IntArray(1)
         GLES20.glGenTextures(1, tex, 0)
@@ -84,6 +88,7 @@ class ArTracker(
         viewH = maxOf(height, 1)
         geometryDirty = true
         GLES20.glViewport(0, 0, viewW, viewH)
+        onLog("GL: tamanho ${viewW}x${viewH}")
     }
 
     override fun onDrawFrame(gl: GL10?) {
@@ -98,6 +103,10 @@ class ArTracker(
             }
             s.setCameraTextureName(textureId)
             val frame = s.update()
+            if (!firstFrame) {
+                firstFrame = true
+                onLog("ARCore: recebendo frames da camera")
+            }
             val camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
 
@@ -136,8 +145,9 @@ class ArTracker(
                 val fps = frames * 1e9 / (now - lastStatusNs)
                 frames = 0
                 lastStatusNs = now
-                val st = if (tracking) "6DOF OK" else "ARCore ainda nao rastreia (mexa o celular devagar, olhe pra algo com textura)"
-                onStatus("$st | ${"%.0f".format(fps)} fps | camera p/ hands.py: ${mjpeg.clients} cliente(s), ${lastJpegKb} KB/frame | $fovText")
+                val why = try { camera.trackingFailureReason.name } catch (_: Throwable) { "?" }
+                val st = if (tracking) "6DOF OK" else "ARCore ainda nao rastreia ($why): mexa o celular devagar olhando algo com textura"
+                onStatus("$st | ${"%.0f".format(fps)} fps | pose enviada: ${poseSender.sentCount} pacotes | camera p/ hands.py: ${mjpeg.clients} cliente(s), ${lastJpegKb} KB/frame | $fovText")
             }
         } catch (e: CameraNotAvailableException) {
             if (!failedCamera) {
@@ -145,7 +155,18 @@ class ArTracker(
                 onStatus("Camera em uso por outro app (feche o IP Webcam / Iriun / camera) e reabra.")
             }
         } catch (e: Exception) {
-            // session paused / not ready: skip this frame
+            // session paused / not ready: skip this frame, but say why (once in a while)
+            reportError(e)
+        }
+    }
+
+    private fun reportError(e: Exception) {
+        val key = "${e.javaClass.simpleName}: ${e.message}"
+        val now = System.nanoTime()
+        val last = seenErrors[key]
+        if (last == null || now - last > 5_000_000_000L) {
+            seenErrors[key] = now
+            onLog("ARCore (frame): $key")
         }
     }
 
