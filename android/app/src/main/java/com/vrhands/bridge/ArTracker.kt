@@ -42,6 +42,9 @@ class ArTracker(
     private var frames = 0
     private var lastStatusNs = System.nanoTime()
     private var lastJpegKb = 0
+    private var lastJpegMs = 0L
+    private val streamDiv = 2        // 2 = sends 320x240 (hands.py detects at ~320 wide anyway); 1 = full 640x480
+    private val jpegQuality = 70
     private var fovText = ""
     private var failedCamera = false
     private var firstFrame = false
@@ -130,7 +133,9 @@ class ArTracker(
             if (mjpeg.clients > 0) {
                 try {
                     frame.acquireCameraImage().use { img ->
-                        val jpg = yuvToJpeg(img, 80)
+                        val t0 = System.nanoTime()
+                        val jpg = yuvToJpeg(img, streamDiv, jpegQuality)
+                        lastJpegMs = (System.nanoTime() - t0) / 1_000_000L
                         lastJpegKb = jpg.size / 1024
                         mjpeg.push(jpg)
                     }
@@ -147,7 +152,7 @@ class ArTracker(
                 lastStatusNs = now
                 val why = try { camera.trackingFailureReason.name } catch (_: Throwable) { "?" }
                 val st = if (tracking) "6DOF OK" else "ARCore ainda nao rastreia ($why): mexa o celular devagar olhando algo com textura"
-                onStatus("$st | ${"%.0f".format(fps)} fps | pose enviada: ${poseSender.sentCount} pacotes | camera p/ hands.py: ${mjpeg.clients} cliente(s), ${lastJpegKb} KB/frame | $fovText")
+                onStatus("$st | ${"%.0f".format(fps)} fps | pose enviada: ${poseSender.sentCount} pacotes | camera p/ hands.py: ${mjpeg.clients} cliente(s), ${lastJpegKb} KB/frame, jpeg ${lastJpegMs} ms | $fovText")
             }
         } catch (e: CameraNotAvailableException) {
             if (!failedCamera) {
@@ -170,32 +175,48 @@ class ArTracker(
         }
     }
 
-    // ---------------- YUV_420_888 -> JPEG ----------------
-    private fun yuvToJpeg(image: Image, quality: Int): ByteArray {
-        val w = image.width
-        val h = image.height
+    // ---------------- YUV_420_888 -> JPEG (downscaled, buffers reused) ----------------
+    private var nv21Buf: ByteArray? = null
+    private var rowBuf = ByteArray(0)
+    private val jpegOut = ByteArrayOutputStream(32 * 1024)
+
+    private fun yuvToJpeg(image: Image, div: Int, quality: Int): ByteArray {
+        val ow = (image.width / div) and 1.inv()
+        val oh = (image.height / div) and 1.inv()
         val yPlane = image.planes[0]
         val uPlane = image.planes[1]
         val vPlane = image.planes[2]
-        val nv21 = ByteArray(w * h * 3 / 2)
+        val size = ow * oh * 3 / 2
+        val nv21: ByteArray = nv21Buf?.takeIf { it.size == size } ?: ByteArray(size).also { nv21Buf = it }
 
         val yBuf = yPlane.buffer
+        val yStride = yPlane.rowStride
+        if (rowBuf.size < yStride) rowBuf = ByteArray(yStride)
+        val row = rowBuf
         var pos = 0
-        for (row in 0 until h) {
-            yBuf.position(row * yPlane.rowStride)
-            yBuf.get(nv21, pos, w)
-            pos += w
+        for (oy in 0 until oh) {
+            val start = oy * div * yStride
+            val n = minOf(yStride, yBuf.limit() - start)
+            yBuf.position(start)
+            yBuf.get(row, 0, n)
+            var sx = 0
+            for (ox in 0 until ow) {
+                nv21[pos++] = row[sx]
+                sx += div
+            }
         }
         val uBuf = uPlane.buffer
         val vBuf = vPlane.buffer
-        for (row in 0 until h / 2) {
-            for (col in 0 until w / 2) {
-                nv21[pos++] = vBuf.get(row * vPlane.rowStride + col * vPlane.pixelStride)
-                nv21[pos++] = uBuf.get(row * uPlane.rowStride + col * uPlane.pixelStride)
+        for (cr in 0 until oh / 2) {
+            val srow = cr * div
+            for (cc in 0 until ow / 2) {
+                val scol = cc * div
+                nv21[pos++] = vBuf.get(srow * vPlane.rowStride + scol * vPlane.pixelStride)
+                nv21[pos++] = uBuf.get(srow * uPlane.rowStride + scol * uPlane.pixelStride)
             }
         }
-        val out = ByteArrayOutputStream(48 * 1024)
-        YuvImage(nv21, ImageFormat.NV21, w, h, null).compressToJpeg(Rect(0, 0, w, h), quality, out)
-        return out.toByteArray()
+        jpegOut.reset()
+        YuvImage(nv21, ImageFormat.NV21, ow, oh, null).compressToJpeg(Rect(0, 0, ow, oh), quality, jpegOut)
+        return jpegOut.toByteArray()
     }
 }
