@@ -8,22 +8,21 @@ import android.media.Image
 import android.opengl.GLES11Ext
 import android.opengl.GLES20
 import android.opengl.GLSurfaceView
+import com.google.ar.core.CameraConfig
+import com.google.ar.core.CameraConfigFilter
 import com.google.ar.core.Config
 import com.google.ar.core.Session
 import com.google.ar.core.TrackingState
 import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.google.ar.core.exceptions.NotYetAvailableException
 import java.io.ByteArrayOutputStream
+import java.util.EnumSet
+import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import javax.microedition.khronos.egl.EGLConfig
 import javax.microedition.khronos.opengles.GL10
 import kotlin.math.atan
 
-/**
- * ARCore session + the (tiny, invisible) GL surface ARCore needs to run.
- * For every camera frame:
- *   1. head pose (6DOF)  -> PoseSender (UDP to the PC)
- *   2. camera image      -> JPEG -> MjpegServer (for hands.py)
- */
 class ArTracker(
     private val activity: Activity,
     private val poseSender: PoseSender,
@@ -41,18 +40,33 @@ class ArTracker(
 
     private var frames = 0
     private var lastStatusNs = System.nanoTime()
-    private var lastJpegKb = 0
-    private var lastJpegMs = 0L
-    private val streamDiv = 2        // 2 = sends 320x240 (hands.py detects at ~320 wide anyway); 1 = full 640x480
+    @Volatile private var lastJpegKb = 0
+    @Volatile private var lastJpegMs = 0L
+    private val streamDiv = 2
     private val jpegQuality = 70
     private var fovText = ""
     private var failedCamera = false
     private var firstFrame = false
     private val seenErrors = HashMap<String, Long>()
 
-    /** Creates and configures the session (call from the main thread, after ARCore is installed). */
+    private val encoder = Executors.newSingleThreadExecutor { r ->
+        Thread(r, "jpeg").apply {
+            isDaemon = true
+            priority = Thread.NORM_PRIORITY - 1
+        }
+    }
+    private val encoding = AtomicBoolean(false)
+    private val planeData = arrayOf(ByteArray(0), ByteArray(0), ByteArray(0))
+    private val rowStrides = IntArray(3)
+    private val pixStrides = IntArray(3)
+    private var imgW = 0
+    private var imgH = 0
+    private var nv21Buf: ByteArray? = null
+    private val jpegOut = ByteArrayOutputStream(32 * 1024)
+
     fun createSession() {
         val s = Session(activity)
+        pickCameraConfig(s)
         val config = Config(s)
         config.planeFindingMode = Config.PlaneFindingMode.DISABLED
         config.lightEstimationMode = Config.LightEstimationMode.DISABLED
@@ -61,8 +75,28 @@ class ArTracker(
         session = s
     }
 
+    private fun pickCameraConfig(s: Session) {
+        try {
+            val current = s.cameraConfig
+            val filter = CameraConfigFilter(s)
+                .setTargetFps(EnumSet.of(CameraConfig.TargetFps.TARGET_FPS_30, CameraConfig.TargetFps.TARGET_FPS_60))
+                .setDepthSensorUsage(EnumSet.of(CameraConfig.DepthSensorUsage.DO_NOT_USE))
+            val best = s.getSupportedCameraConfigs(filter)
+                .filter { it.imageSize.width == current.imageSize.width && it.imageSize.height == current.imageSize.height }
+                .maxByOrNull { it.fpsRange.upper }
+            if (best != null && best.fpsRange.upper > current.fpsRange.upper) {
+                s.cameraConfig = best
+                onLog("ARCore: camera em ${best.fpsRange.upper} fps (${best.imageSize.width}x${best.imageSize.height})")
+            } else {
+                onLog("ARCore: camera em ${current.fpsRange.upper} fps (${current.imageSize.width}x${current.imageSize.height})")
+            }
+        } catch (e: Throwable) {
+            onLog("ARCore: nao consegui escolher a config da camera (${e.javaClass.simpleName})")
+        }
+    }
+
     fun resumeSession() {
-        session?.resume()          // can throw CameraNotAvailableException: the caller handles it
+        session?.resume()
     }
 
     fun pauseSession() {
@@ -72,9 +106,9 @@ class ArTracker(
     fun closeSession() {
         session?.close()
         session = null
+        encoder.shutdownNow()
     }
 
-    // ---------------- GLSurfaceView.Renderer ----------------
     override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
         onLog("GL: superficie criada")
         GLES20.glClearColor(0f, 0f, 0f, 1f)
@@ -113,11 +147,9 @@ class ArTracker(
             val camera = frame.camera
             val tracking = camera.trackingState == TrackingState.TRACKING
 
-            // 1) head pose first (so the JPEG work below never delays it)
             val p = camera.displayOrientedPose
             poseSender.send(p.tx(), p.ty(), p.tz(), p.qx(), p.qy(), p.qz(), p.qw(), tracking)
 
-            // field of view of the camera (to put in hands.py: CAM_FOV_H)
             if (fovText.isEmpty()) {
                 try {
                     val intr = camera.imageIntrinsics
@@ -129,17 +161,17 @@ class ArTracker(
                 }
             }
 
-            // 2) camera image -> MJPEG (only if someone is watching)
-            if (mjpeg.clients > 0) {
+            if (mjpeg.clients > 0 && encoding.compareAndSet(false, true)) {
+                var submitted = false
                 try {
-                    frame.acquireCameraImage().use { img ->
-                        val t0 = System.nanoTime()
-                        val jpg = yuvToJpeg(img, streamDiv, jpegQuality)
-                        lastJpegMs = (System.nanoTime() - t0) / 1_000_000L
-                        lastJpegKb = jpg.size / 1024
-                        mjpeg.push(jpg)
-                    }
+                    frame.acquireCameraImage().use { img -> copyPlanes(img) }
+                    encoder.execute { encodeJob() }
+                    submitted = true
                 } catch (_: NotYetAvailableException) {
+                } catch (e: Exception) {
+                    reportError(e)
+                } finally {
+                    if (!submitted) encoding.set(false)
                 }
             }
 
@@ -160,11 +192,11 @@ class ArTracker(
                 onStatus("Camera em uso por outro app (feche o IP Webcam / Iriun / camera) e reabra.")
             }
         } catch (e: Exception) {
-            // session paused / not ready: skip this frame, but say why (once in a while)
             reportError(e)
         }
     }
 
+    @Synchronized
     private fun reportError(e: Exception) {
         val key = "${e.javaClass.simpleName}: ${e.message}"
         val now = System.nanoTime()
@@ -175,44 +207,63 @@ class ArTracker(
         }
     }
 
-    // ---------------- YUV_420_888 -> JPEG (downscaled, buffers reused) ----------------
-    private var nv21Buf: ByteArray? = null
-    private var rowBuf = ByteArray(0)
-    private val jpegOut = ByteArrayOutputStream(32 * 1024)
+    private fun copyPlanes(img: Image) {
+        imgW = img.width
+        imgH = img.height
+        val planes = img.planes
+        for (i in 0 until 3) {
+            val buf = planes[i].buffer
+            val n = buf.remaining()
+            if (planeData[i].size < n) planeData[i] = ByteArray(n)
+            buf.get(planeData[i], 0, n)
+            rowStrides[i] = planes[i].rowStride
+            pixStrides[i] = planes[i].pixelStride
+        }
+    }
 
-    private fun yuvToJpeg(image: Image, div: Int, quality: Int): ByteArray {
-        val ow = (image.width / div) and 1.inv()
-        val oh = (image.height / div) and 1.inv()
-        val yPlane = image.planes[0]
-        val uPlane = image.planes[1]
-        val vPlane = image.planes[2]
+    private fun encodeJob() {
+        try {
+            val t0 = System.nanoTime()
+            val jpg = yuvToJpeg(imgW, imgH, streamDiv, jpegQuality)
+            lastJpegMs = (System.nanoTime() - t0) / 1_000_000L
+            lastJpegKb = jpg.size / 1024
+            mjpeg.push(jpg)
+        } catch (e: Exception) {
+            reportError(e)
+        } finally {
+            encoding.set(false)
+        }
+    }
+
+    private fun yuvToJpeg(w: Int, h: Int, div: Int, quality: Int): ByteArray {
+        val ow = (w / div) and 1.inv()
+        val oh = (h / div) and 1.inv()
         val size = ow * oh * 3 / 2
         val nv21: ByteArray = nv21Buf?.takeIf { it.size == size } ?: ByteArray(size).also { nv21Buf = it }
-
-        val yBuf = yPlane.buffer
-        val yStride = yPlane.rowStride
-        if (rowBuf.size < yStride) rowBuf = ByteArray(yStride)
-        val row = rowBuf
+        val y = planeData[0]
+        val ys = rowStrides[0]
         var pos = 0
         for (oy in 0 until oh) {
-            val start = oy * div * yStride
-            val n = minOf(yStride, yBuf.limit() - start)
-            yBuf.position(start)
-            yBuf.get(row, 0, n)
-            var sx = 0
+            var idx = oy * div * ys
             for (ox in 0 until ow) {
-                nv21[pos++] = row[sx]
-                sx += div
+                nv21[pos++] = y[idx]
+                idx += div
             }
         }
-        val uBuf = uPlane.buffer
-        val vBuf = vPlane.buffer
+        val u = planeData[1]
+        val v = planeData[2]
+        val us = rowStrides[1]
+        val vs = rowStrides[2]
+        val up = pixStrides[1]
+        val vp = pixStrides[2]
         for (cr in 0 until oh / 2) {
             val srow = cr * div
+            val ub = srow * us
+            val vb = srow * vs
             for (cc in 0 until ow / 2) {
-                val scol = cc * div
-                nv21[pos++] = vBuf.get(srow * vPlane.rowStride + scol * vPlane.pixelStride)
-                nv21[pos++] = uBuf.get(srow * uPlane.rowStride + scol * uPlane.pixelStride)
+                val sc = cc * div
+                nv21[pos++] = v[vb + sc * vp]
+                nv21[pos++] = u[ub + sc * up]
             }
         }
         jpegOut.reset()
