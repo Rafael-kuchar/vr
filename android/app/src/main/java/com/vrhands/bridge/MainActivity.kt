@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -19,12 +20,15 @@ import android.widget.Button
 import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
+import android.widget.SeekBar
 import android.widget.TextView
 import android.widget.Toast
 import androidx.annotation.OptIn
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.VideoSize
 import androidx.media3.common.util.UnstableApi
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.UdpDataSource
@@ -33,8 +37,6 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.ProgressiveMediaSource
 import androidx.media3.extractor.DefaultExtractorsFactory
 import androidx.media3.extractor.ts.DefaultTsPayloadReaderFactory
-import androidx.media3.ui.AspectRatioFrameLayout
-import androidx.media3.ui.PlayerView
 import com.google.ar.core.ArCoreApk
 import com.google.ar.core.exceptions.CameraNotAvailableException
 import com.google.ar.core.exceptions.UnavailableArcoreNotInstalledException
@@ -50,6 +52,8 @@ import java.util.Collections
  *   - camera as MJPEG server     -> http://PHONE:8080/video (for hands.py, replaces IP Webcam)
  *   - receives the game video    <- UDP from the PC (port 5000, H.264 in MPEG-TS), shown fullscreen (side-by-side)
  *
+ * v0.3: the game video is drawn by our own GL renderer (VrRenderer): IPD, lens distortion, chroma, zoom, test grid.
+ *       Tap the screen to cycle: log -> log + settings -> nothing. Volume +/- = IPD.
  * v0.2: the camera server starts when the app opens, every step and every error is written to a log
  * on the screen (and at http://PHONE:8080/ in the PC browser). Tap the screen to hide/show the log.
  */
@@ -60,6 +64,8 @@ class MainActivity : Activity() {
         const val CAMERA_PORT = 8080
         const val VIDEO_PORT = 5000
         const val REQ_CAMERA = 10
+        const val IPD_MIN = 50f
+        const val IPD_MAX = 75f
     }
 
     private val ui = Handler(Looper.getMainLooper())
@@ -69,6 +75,12 @@ class MainActivity : Activity() {
     private lateinit var infoView: TextView
     private lateinit var logView: TextView
 
+    private lateinit var settings: VrSettings
+    private lateinit var panelScroll: ScrollView
+    private val refreshers = ArrayList<() -> Unit>()
+    private var overlayMode = 1        // 0 = nothing, 1 = log, 2 = log + settings
+    private var vrView: GLSurfaceView? = null
+    private var vrRenderer: VrRenderer? = null
     private var glView: GLSurfaceView? = null
     private var player: ExoPlayer? = null
     private var tracker: ArTracker? = null
@@ -79,7 +91,6 @@ class MainActivity : Activity() {
     private var arActive = false
     private var installRequested = false
     private var pcIp = ""
-    private var logVisible = true
 
     private val startTime = System.currentTimeMillis()
     private val logLines = ArrayList<String>()
@@ -88,6 +99,7 @@ class MainActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+        settings = VrSettings(this)
         if (Build.VERSION.SDK_INT >= 28) {
             val lp = window.attributes
             lp.layoutInDisplayCutoutMode = WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
@@ -95,7 +107,7 @@ class MainActivity : Activity() {
         }
         buildUi()
         hideSystemUi()
-        log("App aberto (v0.2). Celular: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}")
+        log("App aberto (v0.3). Celular: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}")
         startServer()
         log("Abra no navegador do PC: http://${bestIp()}:$CAMERA_PORT/  (tem que aparecer o status)")
     }
@@ -151,7 +163,7 @@ class MainActivity : Activity() {
             setPadding(48, 24, 48, 24)
         }
         val title = TextView(this).apply {
-            text = "VR Phone Bridge  (beta 0.2)"
+            text = "VR Phone Bridge  (beta 0.3)"
             textSize = 20f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -181,13 +193,117 @@ class MainActivity : Activity() {
 
         root.addView(setupPanel, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.TOP))
         root.addView(logView, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT, Gravity.BOTTOM))
+        panelScroll = buildSettingsPanel()
+        panelScroll.visibility = View.GONE
+        root.addView(panelScroll, FrameLayout.LayoutParams(1000, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.START))
         root.setOnClickListener {
             if (started) {
-                logVisible = !logVisible
-                logView.visibility = if (logVisible) View.VISIBLE else View.GONE
+                overlayMode = (overlayMode + 1) % 3
+                applyOverlay()
             }
         }
         setContentView(root)
+    }
+
+    private fun applyOverlay() {
+        logView.visibility = if (overlayMode >= 1) View.VISIBLE else View.GONE
+        panelScroll.visibility = if (overlayMode >= 2) View.VISIBLE else View.GONE
+    }
+
+    // ---------------- VR settings panel ----------------
+    private fun buildSettingsPanel(): ScrollView {
+        val col = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(40, 24, 40, 24)
+        }
+        col.addView(TextView(this).apply {
+            text = "Ajustes do VR   (toque na tela: abre/fecha)\nVolume +/- muda o IPD"
+            setTextColor(Color.WHITE)
+            textSize = 14f
+            setTypeface(null, Typeface.BOLD)
+        })
+        addSlider(col, "IPD (distancia entre as lentes)", 50f, 75f, "mm", 1, { settings.ipdMm }, { settings.ipdMm = it })
+        addSlider(col, "Zoom (tamanho da imagem)", 0.5f, 1.6f, "x", 2, { settings.zoom }, { settings.zoom = it })
+        addSlider(col, "Distorcao da lente k1 (centro)", 0f, 1f, "", 2, { settings.k1 }, { settings.k1 = it })
+        addSlider(col, "Distorcao da lente k2 (bordas)", 0f, 1f, "", 2, { settings.k2 }, { settings.k2 = it })
+        addSlider(col, "Chroma (aberracao cromatica)", -0.05f, 0.05f, "", 3, { settings.chroma }, { settings.chroma = it })
+        addSlider(col, "Altura da imagem", -20f, 20f, "mm", 1, { settings.yOffMm }, { settings.yOffMm = it })
+        addToggle(col, "Correcao de lente", { settings.distortion }, { settings.distortion = it })
+        addToggle(col, "Grade de teste", { settings.testGrid }, { settings.testGrid = it })
+        addToggle(col, "Trocar olhos", { settings.swapEyes }, { settings.swapEyes = it })
+        col.addView(Button(this).apply {
+            text = "Restaurar padrao"
+            setOnClickListener {
+                settings.reset()
+                refreshers.forEach { r -> r() }
+            }
+        })
+        col.addView(Button(this).apply {
+            text = "Fechar ajustes"
+            setOnClickListener {
+                overlayMode = 1
+                applyOverlay()
+            }
+        })
+        return ScrollView(this).apply {
+            setBackgroundColor(Color.argb(210, 0, 0, 0))
+            isClickable = true                      // taps on the panel must not reach the "cycle overlay" click
+            addView(col)
+        }
+    }
+
+    private fun addSlider(
+        parent: LinearLayout, label: String, lo: Float, hi: Float, unit: String, decimals: Int,
+        get: () -> Float, set: (Float) -> Unit
+    ) {
+        val title = TextView(this).apply {
+            setTextColor(Color.WHITE)
+            textSize = 13f
+            setPadding(0, 20, 0, 0)
+        }
+        val bar = SeekBar(this).apply { max = 1000 }
+        val refresh = {
+            title.text = label + ": " + "%.${decimals}f".format(get()) + " " + unit
+            val frac = ((get() - lo) / (hi - lo)).coerceIn(0f, 1f)
+            bar.progress = (frac * 1000f).toInt()
+        }
+        refresh()
+        bar.setOnSeekBarChangeListener(object : SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(sb: SeekBar?, progress: Int, fromUser: Boolean) {
+                if (!fromUser) return
+                set(lo + (hi - lo) * progress / 1000f)
+                title.text = label + ": " + "%.${decimals}f".format(get()) + " " + unit
+            }
+
+            override fun onStartTrackingTouch(sb: SeekBar?) {}
+            override fun onStopTrackingTouch(sb: SeekBar?) {
+                settings.save()
+            }
+        })
+        parent.addView(title)
+        parent.addView(bar, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        refreshers.add(refresh)
+    }
+
+    private fun addToggle(parent: LinearLayout, label: String, get: () -> Boolean, set: (Boolean) -> Unit) {
+        val b = Button(this)
+        val refresh = { b.text = label + ": " + (if (get()) "LIGADO" else "desligado") }
+        refresh()
+        b.setOnClickListener {
+            set(!get())
+            settings.save()
+            refresh()
+        }
+        parent.addView(b)
+        refreshers.add(refresh)
+    }
+
+    /** physical pixels per millimeter of the screen (used to turn the IPD in mm into pixels) */
+    private fun pxPerMm(): Float {
+        val dm = resources.displayMetrics
+        var dpi = dm.xdpi
+        if (dpi < 80f || dpi > 800f) dpi = dm.densityDpi.toFloat()
+        return dpi / 25.4f
     }
 
     private fun refreshInfo() {
@@ -258,6 +374,9 @@ class MainActivity : Activity() {
             log("Video do jogo nao iniciou: ${e.javaClass.simpleName}: ${e.message}")
         }
 
+        overlayMode = 1
+        applyOverlay()
+
         val gl = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
             setRenderer(t)
@@ -317,21 +436,30 @@ class MainActivity : Activity() {
     private fun startPlayer() {
         val load = DefaultLoadControl.Builder().setBufferDurationsMs(200, 400, 40, 40).build()
         val p = ExoPlayer.Builder(this).setLoadControl(load).build()
+        val r = VrRenderer(settings, pxPerMm(), { surf -> runOnUiThread { player?.setVideoSurface(surf) } }, { m -> log(m) })
+        vrRenderer = r
         p.addListener(object : Player.Listener {
             override fun onPlayerError(error: PlaybackException) {
                 // no video yet / the stream stopped: try again in a second
                 ui.postDelayed({ prepareVideo(p) }, 1000)
             }
+
+            override fun onVideoSizeChanged(videoSize: VideoSize) {
+                r.setVideoSize(videoSize.width, videoSize.height)
+                log("Video do jogo: chegando ${videoSize.width}x${videoSize.height}")
+            }
         })
-        val pv = PlayerView(this).apply {
-            useController = false
-            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-            player = p
-        }
-        root.addView(pv, 0, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         player = p
+        val v = GLSurfaceView(this).apply {
+            setEGLContextClientVersion(2)
+            setZOrderMediaOverlay(true)             // above the tiny ARCore surface
+            setRenderer(r)
+            renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        }
+        vrView = v
+        root.addView(v, 0, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         prepareVideo(p)
-        log("Video do jogo: esperando em udp porta $VIDEO_PORT (so aparece quando o PC mandar)")
+        log("Video do jogo: esperando em udp porta $VIDEO_PORT (ate chegar, aparece a grade de teste)")
     }
 
     @OptIn(UnstableApi::class)
@@ -355,6 +483,7 @@ class MainActivity : Activity() {
         refreshInfo()
         if (started) {
             resumeAr()
+            vrView?.onResume()
             player?.playWhenReady = true
         }
     }
@@ -363,6 +492,7 @@ class MainActivity : Activity() {
         super.onPause()
         if (started) {
             glView?.onPause()
+            vrView?.onPause()
             tracker?.pauseSession()
             arActive = false
             player?.playWhenReady = false
@@ -377,6 +507,18 @@ class MainActivity : Activity() {
         mjpeg?.stop()
         poseSender?.close()
         super.onDestroy()
+    }
+
+    // volume +/- = IPD +/- 0.5 mm (works with the phone already inside the headset)
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        if (started && (keyCode == KeyEvent.KEYCODE_VOLUME_UP || keyCode == KeyEvent.KEYCODE_VOLUME_DOWN)) {
+            val d = if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) 0.5f else -0.5f
+            settings.ipdMm = (settings.ipdMm + d).coerceIn(IPD_MIN, IPD_MAX)
+            settings.save()
+            refreshers.forEach { r -> r() }
+            return true
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     // ---------------- helpers ----------------
