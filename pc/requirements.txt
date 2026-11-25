@@ -1,2 +1,5 @@
-# relay.py and fake_phone.py use only the Python standard library: nothing to install.
-# (hands.py keeps its own requirements: opencv-python, mediapipe, numpy, openvr)
+# Dependencias do rastreamento de maos (relay.py usa apenas a biblioteca padrao).
+opencv-python
+mediapipe
+numpy
+openvr

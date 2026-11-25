@@ -1,6 +1,5 @@
 @echo off
-REM Starts the relay and streams the screen to the phone.
-REM NVIDIA GPU?  use:  python relay.py --stream --encoder h264_nvenc
+REM Inicia o relay; o encoder H.264 e escolhido automaticamente.
 cd /d "%~dp0"
 python relay.py --stream %*
 pause

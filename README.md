@@ -1,64 +1,82 @@
-# VR Phone Bridge  (beta 0.1)
+# VR Phone Bridge — beta 0.4
 
-Um app Android só, no lugar do **Trinus VR + IP Webcam**:
+App Android + relay para usar o celular como HMD no SteamVR, mantendo o rastreamento de mãos pelo `hands.py`.
 
+## Arquitetura atual
+
+```text
+CELULAR                                                   PC
+ARCore 6DOF ── UDP 6000 ────────────────────────────────► relay.py
+                                                           └─ OpenTrack 6DOF :4242 ─► VRto3D (HMD OpenVR real)
+Câmera ── HTTP MJPEG :8080/video ────────────────────────► hands.py ─► VMT (mãos L/R)
+Tela VRto3D ◄── H.264 bruto (Annex-B) UDP :5000 ◄───────── FFmpeg
 ```
-CELULAR (app)                                   PC
- ARCore ── pose da cabeça (6DOF) ──UDP 6000──►  relay.py ──► OpenTrack UDP :4242 ──► VRto3D (headset do SteamVR)
- câmera ─── MJPEG http://CEL:8080/video ──────► hands.py (igual ao IP Webcam)       └► VMT tracker "cabeça" (6DOF, experimental)
- tela  ◄── H.264 (MPEG-TS) UDP 5000 ◄───────── ffmpeg (iniciado pelo relay.py --stream) captura a tela do VRto3D (lado a lado)
-```
 
-## O que foi testado e o que NÃO foi (leia isto primeiro)
-- **Testado:** o `relay.py` (recentralizar, yaw/pitch, formato OpenTrack e OSC do VMT) com um celular simulado (`fake_phone.py`).
-- **NÃO testado:** o app Android (nunca foi compilado nem rodou num celular), o ffmpeg → celular, o VRto3D recebendo o OpenTrack e o 6DOF via VMT.
-  Pode ter erro de compilação ou de execução. A ideia é você me mandar o erro/print e a gente corrige.
-- **Limitações desta beta:** sem correção de lente do Cardboard (a imagem é lado a lado "reta"), latência provavelmente alta (centenas de ms),
-  e o ARCore entrega a pose a ~30 Hz (ainda sem mistura com giroscópio/previsão).
+- **VRto3D é o driver HMD do SteamVR**. O relay configura `forcedDriver: vrto3d`, ativa `requireHmd` e remove a configuração antiga do `driver_null`.
+- A pose 6DOF do ARCore é enviada ao VRto3D pelo protocolo OpenTrack, na porta UDP 4242. Não usamos mais o tracker VMT como cabeça.
+- O `hands.py` continua separado e envia os controladores esquerdo/direito pelo VMT, slots 0 e 1.
+- O VRto3D gera a imagem estéreo real: cada olho é renderizado pelo jogo/driver com sua própria perspectiva. A saída é configurada como **Side-by-Side (SbS)** e o Android mostra cada metade na lente correspondente.
+- O app Android continua fornecendo a câmera por MJPEG para o `hands.py`, recebendo o vídeo H.264 e aplicando correção de lente/timewarp.
 
-## 1) Gerar o APK (sem instalar nada: GitHub Actions)
-1. Crie um repositório no GitHub e suba **todo o conteúdo desta pasta** (inclusive a pasta oculta `.github`).
-2. Aba **Actions → Build APK → Run workflow**. Em ~5 min aparece o artefato **VRPhoneBridge-apk** (zip com `app-debug.apk`).
-3. Se o build falhar, abra o log do passo "Build debug APK" e me mande o erro.
+**Importante sobre estéreo:** o celular não consegue criar profundidade real a partir de uma imagem 2D única. O jogo precisa estar usando renderização estéreo/VR ou um perfil/mod compatível com o VRto3D. O VRto3D produz os dois olhos; o Android apenas os distribui às lentes.
 
-Alternativa: **Android Studio** → *Open* na pasta `android/` → esperar o sync → *Build > Build APK(s)*.
+## 1. Instalar o driver HMD
 
-## 2) Instalar no celular
-- Copie o `app-debug.apk`, abra e permita "instalar de fontes desconhecidas".
-- O celular precisa ter **ARCore** ("Serviços do Google Play para RA") e suporte a ele. O app pede a instalação se faltar.
-- **Feche o IP Webcam / Iriun / qualquer app de câmera**: o ARCore usa a câmera sozinho. Este app já serve a câmera pro `hands.py`.
+1. Instale o SteamVR.
+2. Instale o [VRto3D (releases oficiais)](https://github.com/oneup03/VRto3D/releases).
+3. Abra o SteamVR uma vez para o VRto3D criar a configuração padrão.
+4. Feche o SteamVR completamente antes da primeira execução do relay.
 
-## 3) PC (uma vez só)
-1. **Python 3** (o `relay.py` não precisa instalar pacotes).
-2. **ffmpeg** no PATH (https://www.gyan.dev/ffmpeg/builds/ → "release essentials").
-3. **VRto3D** (driver de headset do SteamVR): https://github.com/oneup03/VRto3D
-   - Saída em **Side-by-Side** e janela no monitor principal (siga o guia deles).
-   - No OSD (`Ctrl + Home`) → aba *Tracking* → marque **Enable OpenTrack**, porta **4242**, reinicie o SteamVR.
-4. **VMT** (você já usa com o hands.py).
-5. Firewall do Windows: permita o Python na rede privada (UDP 6000).
+O VRto3D é um driver OpenVR que registra o HMD no SteamVR e renderiza modos estéreo nativos, incluindo SbS. O relay seleciona esse driver automaticamente e configura `output_mode: SbS`, `use_open_track: true` e `open_track_port: 4242`.
 
-## 4) Usar
-1. PC: `python relay.py --stream` (ou duplo clique em `start_relay.bat`). GPU NVIDIA? `--encoder h264_nvenc`. PC fraco? `--size 960x540 --bitrate 5M --fps 30`.
-2. Abra o SteamVR (com o VRto3D).
-3. Celular (mesmo Wi-Fi): abra o app, digite o **IP do PC**, toque **Iniciar** e aceite a câmera. Mova o celular devagar até aparecer "6DOF OK".
-4. Coloque no Cardboard (câmera traseira pra frente). No PC, tecle **r** na janela do relay para recentralizar olhando pra frente.
-5. Mãos: `python hands.py http://IP_DO_CELULAR:8080/video` (o relay mostra o comando pronto assim que acha o celular).
-   O app mostra o FOV da câmera na tela: coloque esse valor em `CAM_FOV_H` do hands.py.
-   Se a imagem vier de cabeça pra baixo, use a tecla de rotação do hands.py.
+## 2. Gerar o APK
 
-## 5) 6DOF de verdade (posição da cabeça)
-O OpenTrack no VRto3D é **3DoF** (só rotação), segundo a documentação deles. A posição vai pelo **VMT**: o relay cria um tracker (slot 2) com a pose completa da cabeça.
-O VRto3D sabe seguir um tracker marcado como cabeça (documentado para o Vive Tracker). **Experimental, não testado com o VMT**: em `Steam\config\steamvr.vrsettings`:
-```
-"trackers" : { "/devices/vmt/VMT_2" : "TrackerRole_Camera" },
-"TrackingOverrides" : { "/devices/vmt/VMT_2" : "/user/head" }
-```
-Se o nome do dispositivo for outro, ele aparece no SteamVR (menu → dispositivos). Se funcionar, desative `Enable OpenTrack` no VRto3D para não brigar.
+O workflow `.github/workflows/android.yml` agora dispara em `main`, `master` e `beta`, além de permitir execução manual.
 
-## Ajustes do relay.py
-- Eixo invertido: `--invert yaw` (ou `pitch`, `roll`, `x`, `y`, `z`, separados por vírgula).
-- Altura da cabeça no VMT: `--height 1.6`.
-- Testar sem celular: `python fake_phone.py` (simula uma cabeça girando).
+1. Envie o conteúdo do projeto para a branch `beta`.
+2. No GitHub, abra **Actions → Build APK**.
+3. Baixe o artefato `VRPhoneBridge-apk` quando o build terminar.
 
-## Próximos passos (depois de rodar)
-decodificador de baixa latência (MediaCodec direto), correção de lente Cardboard (shader), mistura ARCore + giroscópio + previsão, recentralizar por gesto, pareamento automático sem digitar IP.
+O APK usa `versionName 0.4-beta`. A branch `main` não precisa ser alterada.
+
+## 3. Preparar o PC
+
+- Python 3.
+- FFmpeg no `PATH` (build com `gdigrab` e, se disponível, `ddagrab`).
+- Para o rastreamento de mãos: instale as dependências com `pip install -r pc/requirements.txt` (`opencv-python`, `mediapipe`, `numpy` e `openvr`).
+- Mantenha `relay.py`, `hands__66_ (2).py` e `hand_landmarker.task` juntos na pasta `pc/`.
+
+O `relay.py` escolhe automaticamente um encoder H.264 que passe no teste. Em PCs sem encoder de hardware compatível, usa `libx264` com preset de baixa latência.
+
+## 4. Usar
+
+1. Feche o SteamVR na primeira execução.
+2. No PC, execute `start_relay.bat`.
+3. O relay salva um backup de `steamvr.vrsettings`, seleciona o driver `vrto3d`, ativa OpenTrack 6DOF e configura a saída SbS.
+4. O SteamVR será iniciado pelo relay. Se o VRto3D pedir uma configuração inicial, confirme que o modo de saída está em **SbS**.
+5. No celular, abra o app, digite o IP do PC e toque em **Iniciar**.
+6. Quando o celular conectar, o relay inicia o stream e abre o `hands.py` automaticamente.
+7. Pressione `r` na janela do relay para recentralizar; `q` encerra.
+
+O servidor MJPEG do celular fica em `http://IP_DO_CELULAR:8080/video`, compatível com o `hands.py`.
+
+### Ajustes úteis
+
+- `python relay.py --stream --fps 30 --size 960x540 --bitrate 5M` — perfil mais leve para PC fraco.
+- `python relay.py --test-video` — testa o vídeo no celular sem depender do jogo.
+- `python relay.py --no-hands` — não inicia o rastreamento de mãos.
+- `python relay.py --manual --stream` — não altera nem inicia o SteamVR automaticamente.
+- `python relay.py --undo-head` — restaura o backup de `steamvr.vrsettings` e da configuração do VRto3D.
+
+## 5. O que foi alterado nesta revisão
+
+- O relay mais novo do RAR substitui a versão antiga do ZIP (mantém previsão de pose, detecção de encoder, captura e inicialização automática do `hands.py`).
+- O Null Driver/falso HMD foi removido da configuração automática.
+- O SteamVR passa a selecionar o driver HMD VRto3D e a receber a pose 6DOF pelo OpenTrack.
+- O VMT deixa de ser usado como HMD; o `hands.py` continua usando VMT para as duas mãos.
+- A saída do VRto3D é forçada para SbS para combinar com o renderer estéreo do Android.
+- O GitHub Actions também compila quando há push na branch `beta`.
+
+## Limitações e testes
+
+O ambiente de edição não tem Android SDK/Gradle nem SteamVR/Windows, então o APK e a inicialização real do driver ainda precisam ser confirmados pelo GitHub Actions e no seu PC. O script Python passou na verificação sintática e os testes simulados de configuração do VRto3D, saída SbS, OpenTrack e restauração do backup.

@@ -11,8 +11,8 @@ android {
         applicationId = "com.vrhands.bridge"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.3-beta"
+        versionCode = 4
+        versionName = "0.4-beta"
     }
 
     buildTypes {

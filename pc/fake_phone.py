@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Pretends to be the phone: sends a head pose that turns left/right and moves a little.
-Use it to test relay.py + VRto3D + VMT without the phone:   python fake_phone.py
+Use it to test relay.py + OpenTrack/VRto3D without the phone:   python fake_phone.py
 """
 import math, socket, struct, sys, time
 ip = sys.argv[1] if len(sys.argv) > 1 else "127.0.0.1"
