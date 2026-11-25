@@ -12,6 +12,7 @@ import android.os.Handler
 import android.os.Looper
 import android.text.InputType
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.SurfaceHolder
 import android.view.SurfaceView
 import android.view.View
@@ -49,7 +50,9 @@ class MainActivity : Activity() {
     private lateinit var logView: TextView
 
     private var glView: GLSurfaceView? = null
-    private var videoView: SurfaceView? = null
+    private var stereoView: GLSurfaceView? = null
+    private var stereo: StereoRenderer? = null
+    private var headSensor: HeadSensor? = null
     private var video: VideoReceiver? = null
     private var tracker: ArTracker? = null
     private var poseSender: PoseSender? = null
@@ -82,7 +85,7 @@ class MainActivity : Activity() {
         }
         buildUi()
         hideSystemUi()
-        log("App aberto (v0.3). Celular: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}")
+        log("App aberto (v0.4 headset). Celular: ${Build.MANUFACTURER} ${Build.MODEL}, Android ${Build.VERSION.RELEASE}")
         startServer()
         log("Abra no navegador do PC: http://${bestIp()}:$CAMERA_PORT/  (tem que aparecer o status)")
     }
@@ -141,7 +144,7 @@ class MainActivity : Activity() {
             setPadding(48, 24, 48, 24)
         }
         val title = TextView(this).apply {
-            text = "VR Phone Bridge  (beta 0.3)"
+            text = "VR Phone Bridge  (beta 0.4 headset)"
             textSize = 20f
             setTypeface(null, Typeface.BOLD)
             setTextColor(Color.WHITE)
@@ -240,19 +243,19 @@ class MainActivity : Activity() {
         val t = ArTracker(this, sender, server, { msg -> setStatus(msg) }, { msg -> log(msg) })
         tracker = t
 
-        try {
-            startVideo()
-        } catch (e: Exception) {
-            log("Video do jogo nao iniciou: ${e.javaClass.simpleName}: ${e.message}")
-        }
-
         val gl = GLSurfaceView(this).apply {
             setEGLContextClientVersion(2)
             setRenderer(t)
             renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
         }
         glView = gl
-        root.addView(gl, FrameLayout.LayoutParams(64, 64, Gravity.BOTTOM or Gravity.END))
+        root.addView(gl, 0, FrameLayout.LayoutParams(64, 64, Gravity.BOTTOM or Gravity.END))
+
+        try {
+            startVideo()
+        } catch (e: Exception) {
+            log("Video do jogo nao iniciou: ${e.javaClass.simpleName}: ${e.message}")
+        }
 
         ui.post(ticker)
         log("Iniciando ARCore...")
@@ -302,47 +305,81 @@ class MainActivity : Activity() {
 
     private fun startVideo() {
         if (video != null) return
-        val receiver = VideoReceiver(VIDEO_PORT, { m -> log(m) }, { w, h -> runOnUiThread { fitVideo(w, h) } })
+        val receiver = VideoReceiver(VIDEO_PORT, { m -> log(m) }, { w, h -> log("Video: ${w}x${h}") })
         video = receiver
-        val sv = SurfaceView(this)
-        sv.holder.addCallback(object : SurfaceHolder.Callback {
-            override fun surfaceCreated(holder: SurfaceHolder) {
-                receiver.attach(holder.surface)
-            }
-
-            override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-            }
-
-            override fun surfaceDestroyed(holder: SurfaceHolder) {
-                receiver.detach()
-            }
-        })
-        videoView = sv
-        root.addView(sv, 0, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT, Gravity.CENTER))
+        val settings = HeadsetSettings(this)
+        settings.load()
+        val sensor = HeadSensor(this)
+        headSensor = sensor
+        if (sensor.start()) log("Giroscopio: ${sensor.sensorName}") else log("Giroscopio nao encontrado (timewarp indisponivel)")
+        val renderer = StereoRenderer(
+            this, settings, sensor,
+            { surf -> receiver.attach(surf) },
+            { receiver.detach() },
+            { m -> log(m) },
+            { onFirstVideoFrame() }
+        )
+        stereo = renderer
+        val sv = GLSurfaceView(this)
+        sv.setEGLContextClientVersion(2)
+        sv.setRenderer(renderer)
+        sv.renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
+        sv.setZOrderMediaOverlay(true)
+        sv.setOnClickListener { renderer.nextParam() }
+        sv.setOnLongClickListener {
+            toggleLog()
+            true
+        }
+        stereoView = sv
+        root.addView(sv, 1, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
         receiver.start()
-        log("Video do jogo: esperando em udp porta $VIDEO_PORT (so aparece quando o PC mandar)")
+        log("Headset: video em udp porta $VIDEO_PORT. Toque = trocar ajuste, volume +/- = mudar, segurar = mostrar/esconder este log")
     }
 
-    private fun fitVideo(w: Int, h: Int) {
-        val sv = videoView ?: return
-        val rw = root.width
-        val rh = root.height
-        if (rw <= 0 || rh <= 0 || w <= 0 || h <= 0) return
-        val scale = minOf(rw.toFloat() / w, rh.toFloat() / h)
-        val lp = FrameLayout.LayoutParams((w * scale).toInt(), (h * scale).toInt(), Gravity.CENTER)
-        sv.layoutParams = lp
+    private fun onFirstVideoFrame() {
+        runOnUiThread {
+            logVisible = false
+            logView.visibility = View.GONE
+        }
+    }
+
+    private fun toggleLog() {
+        logVisible = !logVisible
+        logView.visibility = if (logVisible) View.VISIBLE else View.GONE
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        val r = stereo
+        if (started && r != null) {
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_UP) {
+                r.adjust(1)
+                return true
+            }
+            if (keyCode == KeyEvent.KEYCODE_VOLUME_DOWN) {
+                r.adjust(-1)
+                return true
+            }
+        }
+        return super.onKeyDown(keyCode, event)
     }
 
     override fun onResume() {
         super.onResume()
         hideSystemUi()
         refreshInfo()
-        if (started) resumeAr()
+        if (started) {
+            stereoView?.onResume()
+            headSensor?.start()
+            resumeAr()
+        }
     }
 
     override fun onPause() {
         super.onPause()
         if (started) {
+            stereo?.releaseVideo()
+            stereoView?.onPause()
+            headSensor?.stop()
             glView?.onPause()
             tracker?.pauseSession()
             arActive = false
@@ -353,6 +390,7 @@ class MainActivity : Activity() {
         ui.removeCallbacksAndMessages(null)
         video?.stop()
         video = null
+        headSensor?.stop()
         tracker?.closeSession()
         mjpeg?.stop()
         poseSender?.close()
