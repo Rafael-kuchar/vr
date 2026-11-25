@@ -1,0 +1,5 @@
+# Dependencias do rastreamento de maos (relay.py usa apenas a biblioteca padrao).
+opencv-python
+mediapipe
+numpy
+openvr
