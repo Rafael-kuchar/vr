@@ -1,82 +1,80 @@
-# VR Phone Bridge — beta 0.4
+# VR Phone Bridge — beta 0.5 ALVR integration
 
-App Android + relay para usar o celular como HMD no SteamVR, mantendo o rastreamento de mãos pelo `hands.py`.
+Esta revisão troca a arquitetura antiga baseada em VRto3D + captura do desktop pela base PhoneVR/ALVR. O SteamVR deve carregar o driver HMD do ALVR diretamente; o aplicativo Android usa o cliente PhoneVR/ALVR no modo `noGvr`, com uma ponte ARCore para pose 6DOF e um pequeno servidor MJPEG para o rastreador de mãos existente.
 
-## Arquitetura atual
+**Isto é uma build de integração para teste, não uma versão já validada no Moto G60/SteamVR.** O ambiente desta edição não tem Android SDK/NDK, Windows, SteamVR nem GT 710 para executar o teste físico. O GitHub Actions precisa confirmar primeiro que o APK compila.
+
+## O que muda nesta arquitetura
 
 ```text
-CELULAR                                                   PC
-ARCore 6DOF ── UDP 6000 ────────────────────────────────► relay.py
-                                                           └─ OpenTrack 6DOF :4242 ─► VRto3D (HMD OpenVR real)
-Câmera ── HTTP MJPEG :8080/video ────────────────────────► hands.py ─► VMT (mãos L/R)
-Tela VRto3D ◄── H.264 bruto (Annex-B) UDP :5000 ◄───────── FFmpeg
+Moto G60                                               PC Windows
+ARCore 6DOF ── JNI ──► cliente PhoneVR/ALVR ── Wi-Fi ─► ALVR Server
+Camera YUV ── JPEG ──► MJPEG :8080/video ─────────────► hands__66_ (2).py
+                                                               └─ VMT ─► mãos L/R
+
+Jogo SteamVR ──► driver OpenVR do ALVR ──► vídeo estéreo ──► cliente Android ALVR
 ```
 
-- **VRto3D é o driver HMD do SteamVR**. O relay configura `forcedDriver: vrto3d`, ativa `requireHmd` e remove a configuração antiga do `driver_null`.
-- A pose 6DOF do ARCore é enviada ao VRto3D pelo protocolo OpenTrack, na porta UDP 4242. Não usamos mais o tracker VMT como cabeça.
-- O `hands.py` continua separado e envia os controladores esquerdo/direito pelo VMT, slots 0 e 1.
-- O VRto3D gera a imagem estéreo real: cada olho é renderizado pelo jogo/driver com sua própria perspectiva. A saída é configurada como **Side-by-Side (SbS)** e o Android mostra cada metade na lente correspondente.
-- O app Android continua fornecendo a câmera por MJPEG para o `hands.py`, recebendo o vídeo H.264 e aplicando correção de lente/timewarp.
+- O VRto3D e o relay antigo que capturava o desktop deixam de fazer parte do caminho.
+- O driver HMD é o do ALVR Server; ele registra um HMD no SteamVR. O nome/ícone do dispositivo não é o de um Quest físico.
+- O cliente Android parte do projeto PhoneVR, usa o ALVR `noGvr` e mantém renderização Cardboard com duas texturas/olhos.
+- A pose ARCore é enviada diretamente ao núcleo nativo do cliente ALVR. Se a permissão/câmera/ARCore falhar, o cliente mantém o tracker Cardboard como fallback de orientação.
+- O app publica a câmera em `http://IP_DO_CELULAR:8080/video` para o script MediaPipe/VMT atual.
+- O `hands__66_ (2).py` continua sendo o programa de tracking de mãos no PC.
 
-**Importante sobre estéreo:** o celular não consegue criar profundidade real a partir de uma imagem 2D única. O jogo precisa estar usando renderização estéreo/VR ou um perfil/mod compatível com o VRto3D. O VRto3D produz os dois olhos; o Android apenas os distribui às lentes.
+## Versão do ALVR
 
-## 1. Instalar o driver HMD
+A documentação do PhoneVR informa suporte ao **ALVR Server v20.8.0** para esta linha do cliente. Use essa versão para o primeiro teste; não misture com uma versão mais nova do ALVR até confirmar compatibilidade. Veja o README upstream: https://github.com/PhoneVR-Developers/PhoneVR
 
-1. Instale o SteamVR.
-2. Instale o [VRto3D (releases oficiais)](https://github.com/oneup03/VRto3D/releases).
-3. Abra o SteamVR uma vez para o VRto3D criar a configuração padrão.
-4. Feche o SteamVR completamente antes da primeira execução do relay.
+## Gerar o APK pelo GitHub Actions
 
-O VRto3D é um driver OpenVR que registra o HMD no SteamVR e renderiza modos estéreo nativos, incluindo SbS. O relay seleciona esse driver automaticamente e configura `output_mode: SbS`, `use_open_track: true` e `open_track_port: 4242`.
+1. Extraia este ZIP.
+2. Na branch `beta`, substitua o arquivo `.github/workflows/android.yml` pelo workflow deste pacote. Ele é diferente do workflow simples da versão 0.4: agora precisa baixar e compilar o cliente nativo ALVR/PhoneVR.
+3. Envie as pastas `android/phonevr-overlay`, `pc` e `tools`, além do `README.md`, diretamente para a raiz da branch `beta`. Não envie uma pasta externa envolvendo tudo.
+4. Remova da branch `beta` os lançadores antigos `pc/start_relay.bat` e `pc/fake_phone.py` e o arquivo `pc/relay.py`, para não iniciar acidentalmente a antiga captura de desktop. O novo pacote não usa esses arquivos.
+5. Confira que `.github/workflows/android.yml` aparece na raiz do repositório dentro de `.github/workflows/` e faça **Commit changes** diretamente na `beta`.
+6. Abra **Actions → Build VR Phone Bridge (ALVR)**.
+7. Quando terminar com sucesso, baixe o artefato `VRPhoneBridge-ALVR-beta`. Ele contém `VRPhoneBridge-ALVR.apk` e `VRPhoneBridge-PC-hands.zip`.
 
-## 2. Gerar o APK
+A workflow roda somente quando há commit na branch `beta` (ou quando iniciada manualmente nessa branch). Ela faz checkout do código PhoneVR e dos submódulos ALVR; executa `prepare-alvr-deps.sh nogvr`; aplica os patches ARCore/MJPEG; compila `assembleNoGvrDebug` e publica os artefatos. Ela não altera a branch `main`.
 
-O workflow `.github/workflows/android.yml` agora dispara em `main`, `master` e `beta`, além de permitir execução manual.
+## Primeiro teste no PC
 
-1. Envie o conteúdo do projeto para a branch `beta`.
-2. No GitHub, abra **Actions → Build APK**.
-3. Baixe o artefato `VRPhoneBridge-apk` quando o build terminar.
+1. Instale/abra SteamVR e ALVR Server v20.8.0 no PC.
+2. No ALVR Dashboard, conclua a configuração inicial do streamer e mantenha o servidor ativo.
+3. No primeiro APK, abra VR Phone Bridge e escolha o modo **ALVR** quando a tela de seleção aparecer.
+4. Permita o acesso à câmera. O ARCore precisa da câmera para rastreamento 6DOF; o cliente ainda pode usar o tracker Cardboard se o ARCore não iniciar.
+5. Coloque PC e celular na mesma rede Wi-Fi. Abra `http://IP_DO_CELULAR:8080/` no navegador do PC; a página de status deve responder. `http://IP_DO_CELULAR:8080/shot.jpg` deve mostrar uma imagem quando o ARCore estiver ativo.
+6. Descompacte `VRPhoneBridge-PC-hands.zip`, instale as dependências de `requirements.txt` se ainda não estiverem instaladas e execute `start_hands.bat`. Digite o IP do celular.
 
-O APK usa `versionName 0.4-beta`. A branch `main` não precisa ser alterada.
+## Perfil de desempenho inicial
 
-## 3. Preparar o PC
+A meta é **aproximar de 24 FPS**, não prometer 24 FPS. A GT 710 não deve ser presumida como compatível com NVENC moderno. No ALVR Dashboard, comece com resolução/escala baixa (por exemplo, 50% ou menos), H.264 e encoder por software (x264) quando o ALVR oferecer essa opção. Reduza ainda mais a resolução/bitrate se o i3-9100F não sustentar a taxa. Evite AV1/HEVC no primeiro teste; use H.264.
 
-- Python 3.
-- FFmpeg no `PATH` (build com `gdigrab` e, se disponível, `ddagrab`).
-- Para o rastreamento de mãos: instale as dependências com `pip install -r pc/requirements.txt` (`opencv-python`, `mediapipe`, `numpy` e `openvr`).
-- Mantenha `relay.py`, `hands__66_ (2).py` e `hand_landmarker.task` juntos na pasta `pc/`.
+O script de mãos usa um stream de câmera reduzido e limitado a cerca de 8 FPS para não competir tanto com o ALVR. Isso é independente do FPS do jogo.
 
-O `relay.py` escolhe automaticamente um encoder H.264 que passe no teste. Em PCs sem encoder de hardware compatível, usa `libx264` com preset de baixa latência.
+## Estrutura do projeto
 
-## 4. Usar
+- `.github/workflows/android.yml`: pipeline de build no GitHub Actions.
+- `tools/patch_phonevr.py`: aplica mudanças verificadas ao código upstream do PhoneVR.
+- `android/phonevr-overlay/BridgeTracking.kt`: ARCore 6DOF + aquisição de frames da câmera.
+- `android/phonevr-overlay/BridgeMjpegServer.kt`: endpoint MJPEG usado pelo script das mãos.
+- `pc/hands__66_ (2).py`: rastreador MediaPipe/VMT original.
+- `pc/hand_landmarker.task`: modelo do MediaPipe.
+- `pc/start_hands.bat`: inicia o rastreador e pergunta o IP do telefone.
 
-1. Feche o SteamVR na primeira execução.
-2. No PC, execute `start_relay.bat`.
-3. O relay salva um backup de `steamvr.vrsettings`, seleciona o driver `vrto3d`, ativa OpenTrack 6DOF e configura a saída SbS.
-4. O SteamVR será iniciado pelo relay. Se o VRto3D pedir uma configuração inicial, confirme que o modo de saída está em **SbS**.
-5. No celular, abra o app, digite o IP do PC e toque em **Iniciar**.
-6. Quando o celular conectar, o relay inicia o stream e abre o `hands.py` automaticamente.
-7. Pressione `r` na janela do relay para recentralizar; `q` encerra.
+## Limitações conhecidas deste primeiro candidato
 
-O servidor MJPEG do celular fica em `http://IP_DO_CELULAR:8080/video`, compatível com o `hands.py`.
+- Ainda não foi compilado nesta sessão; o resultado de compilação virá do Actions.
+- A pose ARCore é recentrada na primeira amostra válida. A orientação/eixos e a altura precisam ser conferidos fisicamente depois de instalar.
+- A câmera é fornecida ao script de mãos por MJPEG; o vídeo principal e o tracking da cabeça usam ALVR.
+- A meta de 24 FPS depende do jogo, da resolução, do encoder x264 e da carga no PC. A GT 710/i3-9100F pode ficar abaixo disso.
+- A compatibilidade do cliente PhoneVR/ALVR está documentada para ALVR Server v20.8.0; não atualize o servidor antes do primeiro teste.
 
-### Ajustes úteis
+## Créditos e licenças
 
-- `python relay.py --stream --fps 30 --size 960x540 --bitrate 5M` — perfil mais leve para PC fraco.
-- `python relay.py --test-video` — testa o vídeo no celular sem depender do jogo.
-- `python relay.py --no-hands` — não inicia o rastreamento de mãos.
-- `python relay.py --manual --stream` — não altera nem inicia o SteamVR automaticamente.
-- `python relay.py --undo-head` — restaura o backup de `steamvr.vrsettings` e da configuração do VRto3D.
+O cliente Android é construído a partir de PhoneVR (GPL-3.0) e do fork ALVR-phonevr (MIT), com os patches locais listados acima. Consulte os repositórios e licenças originais:
 
-## 5. O que foi alterado nesta revisão
-
-- O relay mais novo do RAR substitui a versão antiga do ZIP (mantém previsão de pose, detecção de encoder, captura e inicialização automática do `hands.py`).
-- O Null Driver/falso HMD foi removido da configuração automática.
-- O SteamVR passa a selecionar o driver HMD VRto3D e a receber a pose 6DOF pelo OpenTrack.
-- O VMT deixa de ser usado como HMD; o `hands.py` continua usando VMT para as duas mãos.
-- A saída do VRto3D é forçada para SbS para combinar com o renderer estéreo do Android.
-- O GitHub Actions também compila quando há push na branch `beta`.
-
-## Limitações e testes
-
-O ambiente de edição não tem Android SDK/Gradle nem SteamVR/Windows, então o APK e a inicialização real do driver ainda precisam ser confirmados pelo GitHub Actions e no seu PC. O script Python passou na verificação sintática e os testes simulados de configuração do VRto3D, saída SbS, OpenTrack e restauração do backup.
+- https://github.com/PhoneVR-Developers/PhoneVR
+- https://github.com/PhoneVR-Developers/ALVR-phonevr
+- https://github.com/alvr-org/ALVR
