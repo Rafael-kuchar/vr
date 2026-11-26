@@ -276,16 +276,46 @@ def patch_gradle(path: Path) -> None:
 
 
 def patch_manifest(path: Path) -> None:
+    """Declare the camera/network capabilities used by the bridge.
+
+    The upstream ALVR client does not need camera access by itself. The bridge
+    uses ARCore both for the external 6DOF pose and for the optional MJPEG hand
+    camera, so requesting the runtime permission without declaring it in the
+    manifest would always fail on Android.
+    """
     text = path.read_text(encoding="utf-8")
-    if 'com.google.ar.core' not in text:
-        # Add an optional ARCore marker after the opening application tag's attributes.
-        marker = '        android:extractNativeLibs="true">'
-        text = replace_once(
-            text,
-            marker,
-            marker + '\n        <meta-data android:name="com.google.ar.core" android:value="optional" />',
-            "ARCore optional manifest metadata",
-        )
+
+    manifest_open = re.search(r"<manifest\b[^>]*>", text, flags=re.DOTALL)
+    if not manifest_open:
+        raise RuntimeError(f"Could not find <manifest> root in {path}")
+
+    permissions = [
+        "android.permission.INTERNET",
+        "android.permission.ACCESS_NETWORK_STATE",
+        "android.permission.CAMERA",
+    ]
+    additions = []
+    for permission in permissions:
+        marker = f'android:name="{permission}"'
+        if marker not in text:
+            additions.append(f'    <uses-permission android:name="{permission}" />')
+
+    feature = '<uses-feature android:name="android.hardware.camera.any" android:required="false" />'
+    if feature not in text:
+        additions.append(feature)
+
+    if additions:
+        insert_at = manifest_open.end()
+        text = text[:insert_at] + "\n" + "\n".join(additions) + text[insert_at:]
+
+    if 'android:name="com.google.ar.core"' not in text:
+        application_open = re.search(r"<application\b[^>]*>", text, flags=re.DOTALL)
+        if not application_open:
+            raise RuntimeError(f"Could not find <application> in {path}")
+        metadata = '\n        <meta-data android:name="com.google.ar.core" android:value="optional" />'
+        insert_at = application_open.end()
+        text = text[:insert_at] + metadata + text[insert_at:]
+
     path.write_text(text, encoding="utf-8")
 
 
@@ -329,7 +359,7 @@ def main() -> None:
     patch_manifest(manifest_file)
     patch_strings(strings_file)
 
-    for name in ("BridgeTracking.kt", "BridgeMjpegServer.kt"):
+    for name in ("BridgeTracking.java", "BridgeMjpegServer.java"):
         source = args.overlay / name
         if not source.is_file():
             raise FileNotFoundError(f"Missing overlay source: {source}")

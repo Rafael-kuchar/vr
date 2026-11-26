@@ -1,79 +1,119 @@
-# VR Phone Bridge — beta 0.5 ALVR integration
+# VR Phone Bridge — beta 0.5.1 (ALVR)
 
-Esta revisão troca a arquitetura antiga baseada em VRto3D + captura do desktop pela base PhoneVR/ALVR. O SteamVR deve carregar o driver HMD do ALVR diretamente; o aplicativo Android usa o cliente PhoneVR/ALVR no modo `noGvr`, com uma ponte ARCore para pose 6DOF e um pequeno servidor MJPEG para o rastreador de mãos existente.
+Esta é uma revisão de correção do pacote-fonte 0.5. Ela ainda precisa compilar no GitHub Actions e ser testada no Moto G60/Windows; o ZIP não é um APK já validado.
 
-**Isto é uma build de integração para teste, não uma versão já validada no Moto G60/SteamVR.** O ambiente desta edição não tem Android SDK/NDK, Windows, SteamVR nem GT 710 para executar o teste físico. O GitHub Actions precisa confirmar primeiro que o APK compila.
-
-## O que muda nesta arquitetura
+## Arquitetura
 
 ```text
-Moto G60                                               PC Windows
-ARCore 6DOF ── JNI ──► cliente PhoneVR/ALVR ── Wi-Fi ─► ALVR Server
-Camera YUV ── JPEG ──► MJPEG :8080/video ─────────────► hands__66_ (2).py
-                                                               └─ VMT ─► mãos L/R
-
-Jogo SteamVR ──► driver OpenVR do ALVR ──► vídeo estéreo ──► cliente Android ALVR
+Moto G60                                                   PC Windows
+ARCore 6DOF ──► cliente PhoneVR/ALVR ── Wi-Fi ───────────► ALVR Server 20.8.0
+Câmera YUV ───► MJPEG :8080/video ───────────────────────► MediaPipe/VMT (mãos)
+Jogo SteamVR ──► driver ALVR ──► vídeo H.264 estéreo ────► cliente Android ALVR
 ```
 
-- O VRto3D e o relay antigo que capturava o desktop deixam de fazer parte do caminho.
-- O driver HMD é o do ALVR Server; ele registra um HMD no SteamVR. O nome/ícone do dispositivo não é o de um Quest físico.
-- O cliente Android parte do projeto PhoneVR, usa o ALVR `noGvr` e mantém renderização Cardboard com duas texturas/olhos.
-- A pose ARCore é enviada diretamente ao núcleo nativo do cliente ALVR. Se a permissão/câmera/ARCore falhar, o cliente mantém o tracker Cardboard como fallback de orientação.
-- O app publica a câmera em `http://IP_DO_CELULAR:8080/video` para o script MediaPipe/VMT atual.
-- O `hands__66_ (2).py` continua sendo o programa de tracking de mãos no PC.
+- O VRto3D e o antigo `relay.py` que capturava a área de trabalho não fazem parte deste fluxo.
+- O HMD do SteamVR é registrado pelo driver ALVR. O app do celular é o cliente de streaming.
+- O `noGvr` é a variante PhoneVR que usa o cliente ALVR; o campo inicial de IP do PC faz parte desse fluxo. Não existe um seletor extra de modo nesse APK.
+- A câmera/MJPEG para as mãos é um serviço separado iniciado quando a Activity ALVR do app está aberta. O script `start_hands.bat` não inicia nem conecta o ALVR.
 
-## Versão do ALVR
+## Correções nesta revisão
 
-A documentação do PhoneVR informa suporte ao **ALVR Server v20.8.0** para esta linha do cliente. Use essa versão para o primeiro teste; não misture com uma versão mais nova do ALVR até confirmar compatibilidade. Veja o README upstream: https://github.com/PhoneVR-Developers/PhoneVR
+1. PhoneVR está fixado na tag `v2.0.0-beta`, a release que declara integração com ALVR `20.8.0`; o workflow não baixa `master` móvel.
+2. O workflow retira a linha `cargo update` do helper upstream para não atualizar as dependências travadas do release durante o build.
+3. O manifesto agora declara `CAMERA`, `INTERNET` e `ACCESS_NETWORK_STATE`, marca câmera como recurso opcional e declara ARCore opcional. Antes o app pedia `CAMERA` em runtime sem declarar essa permissão no manifesto.
+4. A ponte de ARCore/MJPEG está em Java puro, sem adicionar plugin Kotlin ao projeto PhoneVR.
+5. O workflow valida o patch antes de compilar e inclui o verificador `check_phone_camera.bat` no pacote de mãos.
 
-## Gerar o APK pelo GitHub Actions
+## Versões
 
-1. Extraia este ZIP.
-2. Na branch `beta`, substitua o arquivo `.github/workflows/android.yml` pelo workflow deste pacote. Ele é diferente do workflow simples da versão 0.4: agora precisa baixar e compilar o cliente nativo ALVR/PhoneVR.
-3. Envie as pastas `android/phonevr-overlay`, `pc` e `tools`, além do `README.md`, diretamente para a raiz da branch `beta`. Não envie uma pasta externa envolvendo tudo.
-4. Remova da branch `beta` os lançadores antigos `pc/start_relay.bat` e `pc/fake_phone.py` e o arquivo `pc/relay.py`, para não iniciar acidentalmente a antiga captura de desktop. O novo pacote não usa esses arquivos.
-5. Confira que `.github/workflows/android.yml` aparece na raiz do repositório dentro de `.github/workflows/` e faça **Commit changes** diretamente na `beta`.
-6. Abra **Actions → Build VR Phone Bridge (ALVR)**.
-7. Quando terminar com sucesso, baixe o artefato `VRPhoneBridge-ALVR-beta`. Ele contém `VRPhoneBridge-ALVR.apk` e `VRPhoneBridge-PC-hands.zip`.
+- ALVR Server para Windows: **20.8.0**.
+- Cliente Android: PhoneVR `v2.0.0-beta`, flavor `noGvr`, com os patches deste repositório.
+- Não misture esta combinação com outras versões de cliente/servidor durante o primeiro teste.
 
-A workflow roda somente quando há commit na branch `beta` (ou quando iniciada manualmente nessa branch). Ela faz checkout do código PhoneVR e dos submódulos ALVR; executa `prepare-alvr-deps.sh nogvr`; aplica os patches ARCore/MJPEG; compila `assembleNoGvrDebug` e publica os artefatos. Ela não altera a branch `main`.
+## Atualizar a branch `beta`
 
-## Primeiro teste no PC
+1. Extraia o ZIP.
+2. Na branch `beta`, substitua `.github/workflows/android.yml` pelo workflow deste pacote.
+3. Substitua as pastas `android/phonevr-overlay`, `pc`, `tools` e o `README.md`, diretamente na raiz do repositório.
+4. A raiz deve conter `.github`, `android`, `pc`, `tools` e `README.md`.
+5. Faça commit diretamente em `beta` (não crie Pull Request para `main`).
+6. Em **Actions**, abra `Build VR Phone Bridge (ALVR)`. O artefato esperado é `VRPhoneBridge-ALVR-beta`.
+7. O artefato contém `VRPhoneBridge-ALVR.apk` e `VRPhoneBridge-PC-hands.zip`.
 
-1. Instale/abra SteamVR e ALVR Server v20.8.0 no PC.
-2. No ALVR Dashboard, conclua a configuração inicial do streamer e mantenha o servidor ativo.
-3. No primeiro APK, abra VR Phone Bridge e escolha o modo **ALVR** quando a tela de seleção aparecer.
-4. Permita o acesso à câmera. O ARCore precisa da câmera para rastreamento 6DOF; o cliente ainda pode usar o tracker Cardboard se o ARCore não iniciar.
-5. Coloque PC e celular na mesma rede Wi-Fi. Abra `http://IP_DO_CELULAR:8080/` no navegador do PC; a página de status deve responder. `http://IP_DO_CELULAR:8080/shot.jpg` deve mostrar uma imagem quando o ARCore estiver ativo.
-6. Descompacte `VRPhoneBridge-PC-hands.zip`, instale as dependências de `requirements.txt` se ainda não estiverem instaladas e execute `start_hands.bat`. Digite o IP do celular.
+O workflow compila o flavor `noGvr` a partir da tag fixada. Se o build falhar, não instale um APK antigo achando que é o novo: abra o job que falhou e confira o primeiro erro vermelho.
 
-## Perfil de desempenho inicial
+## Primeira conexão ALVR — sequência correta
 
-A meta é **aproximar de 24 FPS**, não prometer 24 FPS. A GT 710 não deve ser presumida como compatível com NVENC moderno. No ALVR Dashboard, comece com resolução/escala baixa (por exemplo, 50% ou menos), H.264 e encoder por software (x264) quando o ALVR oferecer essa opção. Reduza ainda mais a resolução/bitrate se o i3-9100F não sustentar a taxa. Evite AV1/HEVC no primeiro teste; use H.264.
+### No PC
 
-O script de mãos usa um stream de câmera reduzido e limitado a cerca de 8 FPS para não competir tanto com o ALVR. Isso é independente do FPS do jogo.
+1. Instale/inicie o **ALVR Server 20.8.0** pelo ALVR Launcher.
+2. Termine a configuração inicial do Streamer no Dashboard.
+3. Deixe PC e Moto G60 na mesma rede local Wi-Fi. Desative VPN durante o primeiro pareamento.
+4. No Dashboard, use o botão **Launch SteamVR** (ou **Restart SteamVR**) para carregar o driver ALVR. O Dashboard sozinho consegue editar configurações, mas a descoberta de clientes depende do driver carregado pelo SteamVR.
 
-## Estrutura do projeto
+### No Moto G60
 
-- `.github/workflows/android.yml`: pipeline de build no GitHub Actions.
-- `tools/patch_phonevr.py`: aplica mudanças verificadas ao código upstream do PhoneVR.
-- `android/phonevr-overlay/BridgeTracking.kt`: ARCore 6DOF + aquisição de frames da câmera.
-- `android/phonevr-overlay/BridgeMjpegServer.kt`: endpoint MJPEG usado pelo script das mãos.
-- `pc/hands__66_ (2).py`: rastreador MediaPipe/VMT original.
-- `pc/hand_landmarker.task`: modelo do MediaPipe.
-- `pc/start_hands.bat`: inicia o rastreador e pergunta o IP do telefone.
+1. Abra **VR Phone Bridge**.
+2. Na tela de endereço, informe o IPv4 do PC (no Windows, `ipconfig` → adaptador Wi-Fi/Ethernet → IPv4).
+3. Confirme o botão de continuar/conectar da própria tela. O app precisa sair dessa página e abrir a tela cliente/VR. Se permanecer somente no campo de IP, o cliente ainda não entrou na Activity ALVR.
+4. Conceda a permissão de câmera quando o Android solicitar. Ela é usada pela ponte ARCore e pela câmera MJPEG para as mãos.
+5. Mantenha o app aberto enquanto o ALVR faz a descoberta.
 
-## Limitações conhecidas deste primeiro candidato
+### Parear no ALVR
 
-- Ainda não foi compilado nesta sessão; o resultado de compilação virá do Actions.
-- A pose ARCore é recentrada na primeira amostra válida. A orientação/eixos e a altura precisam ser conferidos fisicamente depois de instalar.
-- A câmera é fornecida ao script de mãos por MJPEG; o vídeo principal e o tracking da cabeça usam ALVR.
-- A meta de 24 FPS depende do jogo, da resolução, do encoder x264 e da carga no PC. A GT 710/i3-9100F pode ficar abaixo disso.
-- A compatibilidade do cliente PhoneVR/ALVR está documentada para ALVR Server v20.8.0; não atualize o servidor antes do primeiro teste.
+- A descoberta ALVR é iniciada pelo cliente por broadcast UDP na porta `9943`. Quando o driver está rodando, o cliente aparece na área **New devices** do Dashboard; clique em **Trust**.
+- Um dispositivo que você adicionou manualmente com hostname inventado ou incompleto pode ficar como `Disconnected`. Remova essa entrada manual incompleta e deixe a descoberta automática funcionar primeiro.
+- O pareamento manual requer o hostname exato que aparece na tela de boas-vindas do cliente, além do IP do telefone; IP sozinho não basta.
+
+Se o cliente não aparecer em **New devices** mesmo com SteamVR iniciado:
+
+1. Confirme que os dois aparelhos estão na mesma sub-rede Wi-Fi e que o roteador não usa `AP isolation`/isolamento de clientes.
+2. Permita ALVR Streamer/Dashboard e `vrserver.exe` no Firewall do Windows para redes **Privadas**. O ALVR Dashboard tem ferramenta de instalação/configuração do firewall.
+3. Verifique se UDP `9943` (descoberta) e as portas de comunicação do ALVR não estão bloqueadas. A documentação ALVR identifica UDP 9943 como porta de descoberta.
+4. Não desative permanentemente o Firewall do Windows.
+
+## Tracking das mãos — separado do ALVR
+
+O app expõe a câmera do Moto G60 em `http://IP_DO_CELULAR:8080/video` somente quando a Activity ALVR e a ponte de câmera estão ativas.
+
+1. Extraia `VRPhoneBridge-PC-hands.zip`.
+2. Execute `check_phone_camera.bat` e informe o **IPv4 do CELULAR**. Ele consulta `/` e `/shot.jpg`.
+3. `HTTP 200` em `/shot.jpg` indica que existe um frame de câmera. `HTTP 503` indica que o servidor está ativo, mas ainda não produziu frame ARCore.
+4. Só depois execute `start_hands.bat` e informe novamente o **IP do CELULAR**. Ele executa MediaPipe e envia as mãos via VMT/OSC para `127.0.0.1:39570`.
+5. O driver/receiver VMT precisa estar instalado e ativo no PC, conforme o setup de mãos anterior.
+
+**Os dois campos de IP têm destinos diferentes:**
+
+- Campo dentro do app Android: IP do **PC** (ALVR Streamer).
+- Campo dos `.bat` de mãos no PC: IP do **celular** (câmera MJPEG `:8080`).
+
+O `start_hands.bat` não abre SteamVR, não faz o pareamento ALVR e não transmite a imagem do jogo.
+
+## Perfil inicial de desempenho
+
+Meta de teste: tentar chegar perto de **24 FPS**, sem garantia. Comece com H.264, resolução/escala baixa (50% ou menos) e bitrate modesto. A GT 710 não deve ser presumida compatível com NVENC moderno; use x264/software se o ALVR oferecer essa opção. Se o i3-9100F não sustentar, reduza resolução e bitrate.
+
+O stream MJPEG para as mãos é reduzido e limitado a cerca de 8 FPS para não competir tanto com o VR.
+
+## Diagnóstico
+
+- **O app fica preso na tela do IP do PC:** ele ainda não entrou na Activity de streaming. Confirme se você apertou o botão da tela depois de informar o IPv4; veja os logs Android se continuar.
+- **ALVR não mostra New devices:** verifique se SteamVR foi iniciado pelo Dashboard (driver carregado), rede/sub-rede, VPN, isolamento Wi-Fi e firewall UDP 9943.
+- **Uma linha manual aparece Disconnected:** isso não significa que o cadastro por IP conectou. Remova a entrada incompleta; o ALVR primeiro precisa receber a descoberta do cliente.
+- **`check_phone_camera.bat` não conecta:** o app não chegou à Activity ALVR, a permissão de câmera não foi concedida ou a rede/firewall bloqueou a porta 8080.
+- **`/` responde e `/shot.jpg` retorna 503:** o servidor MJPEG está aberto, mas o ARCore ainda não entregou um frame; confira a permissão e a disponibilidade do Google Play Services for AR.
+- **Vídeo conecta, mas há somente rotação:** ARCore não iniciou ou não está rastreando; nesse caso o cliente usa o fallback de orientação Cardboard.
+
+## Limitações honestas
+
+- O ZIP é fonte + workflow; ele precisa passar pelo GitHub Actions e por teste físico antes de ser considerado funcional.
+- A posição 6DOF do ARCore e a transformação dos eixos precisam ser confirmadas no aparelho real.
+- 24 FPS depende do jogo, resolução, bitrate e codificação por software. A GT 710 pode ficar abaixo disso.
+- O ícone do HMD vem do driver ALVR; o app não transforma o telefone em um Quest físico.
 
 ## Créditos e licenças
 
-O cliente Android é construído a partir de PhoneVR (GPL-3.0) e do fork ALVR-phonevr (MIT), com os patches locais listados acima. Consulte os repositórios e licenças originais:
+O cliente Android é baseado em PhoneVR `v2.0.0-beta` (GPL-3.0) e ALVR-phonevr (MIT), com patches locais em `tools/patch_phonevr.py` e `android/phonevr-overlay/`. Consulte os repositórios e licenças originais:
 
 - https://github.com/PhoneVR-Developers/PhoneVR
 - https://github.com/PhoneVR-Developers/ALVR-phonevr
