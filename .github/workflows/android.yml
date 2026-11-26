@@ -33,6 +33,10 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # The legacy "tools" SDK package was removed from Google's repository.
+          # Install only platform-tools here; the next step installs pinned packages.
+          packages: 'platform-tools'
 
       - name: Install Android NDK and build tools
         shell: bash
