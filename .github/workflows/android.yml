@@ -1,24 +1,113 @@
-name: Build APK
-on:
-  push:
-    branches: [main, master]
-  workflow_dispatch: {}
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-java@v4
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
         with:
-          distribution: temurin
-          java-version: 17
-      - uses: gradle/actions/setup-gradle@v3
+          # The legacy "tools" SDK package was removed from Google's repository.
+          # Install only platform-tools here; the next step installs pinned packages.
+          packages: 'platform-tools'
+
+      - name: Install Android NDK and build tools
+        shell: bash
+        run: |
+          # Process substitution avoids pipefail treating yes's expected SIGPIPE as a failure.
+          sdkmanager --licenses < <(yes)
+          sdkmanager \
+            "platform-tools" \
+            "platforms;android-34" \
+            "build-tools;34.0.0" \
+            "ndk;25.2.9519653" \
+            "cmake;3.22.1"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/25.2.9519653" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/25.2.9519653" >> "$GITHUB_ENV"
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake ninja-build pkg-config libssl-dev libclang-dev protobuf-compiler zip unzip
+
+      - name: Set up Rust for ALVR Android client core
+        uses: dtolnay/rust-toolchain@stable
         with:
-          gradle-version: 8.7
-      - name: Build debug APK
-        working-directory: android
-        run: gradle assembleDebug --no-daemon
-      - uses: actions/upload-artifact@v4
+          targets: aarch64-linux-android,armv7-linux-androideabi,x86_64-linux-android,i686-linux-android
+
+      - name: Prepare PhoneVR ALVR noGvr dependencies
+        working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
+        shell: bash
+        run: |
+          chmod +x prepare-alvr-deps.sh
+          # Keep the dependency versions pinned by the PhoneVR/ALVR release.
+          # The upstream helper runs `cargo update`, which can move a 20.8.0
+          # client onto newer, incompatible crates during a later rebuild.
+          sed -i '/^[[:space:]]*cargo update[[:space:]]*$/d' prepare-alvr-deps.sh
+          ./prepare-alvr-deps.sh nogvr
+
+      - name: Apply VR Phone Bridge integration
+        run: |
+          python3 tools/patch_phonevr.py \
+            --phonevr .upstream/PhoneVR/code/mobile/android/PhoneVR \
+            --overlay android/phonevr-overlay
+          MANIFEST=.upstream/PhoneVR/code/mobile/android/PhoneVR/app/src/main/AndroidManifest.xml
+          grep -q 'android.permission.CAMERA' "$MANIFEST"
+          grep -q 'com.google.ar.core' "$MANIFEST"
+          grep -q 'BridgeTracking' .upstream/PhoneVR/code/mobile/android/PhoneVR/app/src/main/java/viritualisres/phonevr/ALVRActivity.java
+
+      - name: Provide CI-only signing and Firebase config files
+        working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
+        shell: bash
+        run: |
+          cat > keystore.properties <<'PROPS'
+          storeFile=PhoneVRKeyStorePR.jks
+          keyAlias=PhoneVRKeyPR
+          PROPS
+          mkdir -p app
+          cat > app/google-services.json <<'JSON'
+          {
+            "project_info": {
+              "project_number": "123456789012",
+              "project_id": "vr-phone-bridge-ci",
+              "storage_bucket": "vr-phone-bridge-ci.appspot.com"
+            },
+            "client": [
+              {
+                "client_info": {
+                  "mobilesdk_app_id": "1:123456789012:android:1234567890abcdef",
+                  "android_client_info": { "package_name": "com.vrhands.bridge" }
+                },
+                "oauth_client": [],
+                "api_key": [ { "current_key": "CI_ONLY_NOT_A_REAL_API_KEY" } ],
+                "services": { "appinvite_service": { "other_platform_oauth_client": [] } }
+              }
+            ],
+            "configuration_version": "1"
+          }
+          JSON
+
+      - name: Extract Cardboard native library
+        working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
+        run: ./gradlew :app:extractNdk --no-daemon
+
+      - name: Build ALVR noGvr debug APK
+        working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
+        run: ./gradlew :app:assembleNoGvrDebug --no-daemon -x spotlessCheck --stacktrace
+
+      - name: Validate hand-tracking script syntax
+        run: python3 -m py_compile "pc/hands__66_ (2).py" tools/patch_phonevr.py
+
+      - name: Assemble user test package
+        shell: bash
+        run: |
+          mkdir -p dist/pc
+          cp .upstream/PhoneVR/code/mobile/android/PhoneVR/app/build/outputs/apk/noGvr/debug/app-noGvr-debug.apk dist/VRPhoneBridge-ALVR.apk
+          cp "pc/hands__66_ (2).py" pc/hand_landmarker.task pc/requirements.txt pc/start_hands.bat pc/check_phone_camera.bat dist/pc/
+          cd dist
+          zip -r VRPhoneBridge-PC-hands.zip pc
+
+      - name: Upload test artifacts
+        uses: actions/upload-artifact@v4
         with:
-          name: VRPhoneBridge-apk
-          path: android/app/build/outputs/apk/debug/app-debug.apk
+          name: VRPhoneBridge-ALVR-beta
+          path: |
+            dist/VRPhoneBridge-ALVR.apk
+            dist/VRPhoneBridge-PC-hands.zip
+          if-no-files-found: error
+          retention-days: 14
