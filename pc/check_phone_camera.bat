@@ -20,8 +20,10 @@ echo.
 echo Testando se ja existe um frame da camera...
 curl.exe --connect-timeout 3 --max-time 5 -sS -o NUL -w "HTTP %%{http_code}\n" "http://%PHONE_IP%:8080/shot.jpg"
 echo.
+echo.
 echo HTTP 200 = camera entregando frame.
-echo HTTP 503 = servidor existe, mas ainda nao ha frame ARCore.
+echo HTTP 503 = servidor respondeu, mas nao conseguiu obter frame ARCore.
+echo Se aparecer 503, confira a permissao de camera e se o app esta na tela ALVR.
 echo.
 pause
 exit /b 0

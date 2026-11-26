@@ -1,4 +1,4 @@
-# VR Phone Bridge — beta 0.5.1 (ALVR)
+# VR Phone Bridge — beta 0.5.2 (ALVR camera check fix)
 
 Esta é uma revisão de correção do pacote-fonte 0.5. Ela ainda precisa compilar no GitHub Actions e ser testada no Moto G60/Windows; o ZIP não é um APK já validado.
 
@@ -17,6 +17,8 @@ Jogo SteamVR ──► driver ALVR ──► vídeo H.264 estéreo ────�
 - A câmera/MJPEG para as mãos é um serviço separado iniciado quando a Activity ALVR do app está aberta. O script `start_hands.bat` não inicia nem conecta o ALVR.
 
 ## Correções nesta revisão
+
+0. Corrigido o ciclo entre `/shot.jpg` e `/video`: antes o encoder JPEG só era ativado por um cliente `/video`, mas `start_hands.bat` exigia `/shot.jpg` antes de abrir `/video`. Agora uma solicitação `/shot.jpg` pede temporariamente um frame ao ARCore; não é necessário manter codificação contínua quando não há clientes.
 
 1. PhoneVR está fixado na tag `v2.0.0-beta`, a release que declara integração com ALVR `20.8.0`; o workflow não baixa `master` móvel.
 2. O workflow retira a linha `cargo update` do helper upstream para não atualizar as dependências travadas do release durante o build.

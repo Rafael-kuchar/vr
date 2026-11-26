@@ -157,7 +157,7 @@ final class BridgeTracking {
             }
 
             long now = SystemClock.elapsedRealtimeNanos();
-            if (mjpeg.getClientCount() > 0 && now - lastJpegNs >= JPEG_INTERVAL_NS
+            if (mjpeg.hasDemand() && now - lastJpegNs >= JPEG_INTERVAL_NS
                     && encoding.compareAndSet(false, true)) {
                 boolean queued = false;
                 Image image = null;

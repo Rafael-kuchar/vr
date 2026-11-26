@@ -15,16 +15,17 @@ set /p PHONE_IP=Digite o IPv4 do Moto G60:
 if "%PHONE_IP%"=="" goto :empty
 
 echo.
-echo Testando a camera do celular...
-curl.exe --fail --connect-timeout 3 --max-time 5 -sS -o NUL "http://%PHONE_IP%:8080/shot.jpg"
+echo Solicitando um frame de teste da camera...
+curl.exe --fail --connect-timeout 3 --max-time 6 -sS -o NUL "http://%PHONE_IP%:8080/shot.jpg"
 if errorlevel 1 (
-  echo Nao consegui acessar a camera ainda.
-  echo Rode check_phone_camera.bat e confira o app/permissao/rede.
+  echo O servidor respondeu sem entregar um frame valido.
+  echo Rode check_phone_camera.bat e veja se o resultado e HTTP 503.
+  echo Se for 503, confira a permissao de camera e mantenha o app aberto.
   pause
   exit /b 1
 )
 
-echo Iniciando MediaPipe/VMT...
+echo Camera OK. Iniciando MediaPipe/VMT...
 python "hands__66_ (2).py" "http://%PHONE_IP%:8080/video"
 if errorlevel 1 (
   echo.

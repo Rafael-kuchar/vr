@@ -19,6 +19,7 @@ final class BridgeMjpegServer {
     private final ReentrantLock lock = new ReentrantLock();
     private final Condition changed = lock.newCondition();
     private final AtomicInteger clients = new AtomicInteger(0);
+    private final AtomicInteger snapshotRequests = new AtomicInteger(0);
 
     private volatile boolean running;
     private volatile ServerSocket serverSocket;
@@ -35,6 +36,11 @@ final class BridgeMjpegServer {
 
     int getClientCount() {
         return clients.get();
+    }
+
+    /** True while a streaming client or a one-shot camera check needs a frame. */
+    boolean hasDemand() {
+        return clients.get() > 0 || snapshotRequests.get() > 0;
     }
 
     synchronized void start() {
@@ -107,6 +113,24 @@ final class BridgeMjpegServer {
         }
     }
 
+    private byte[] awaitSnapshot(long timeoutMs) {
+        long remaining = TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        lock.lock();
+        try {
+            while (latestFrame == null && running && remaining > 0) {
+                try {
+                    remaining = changed.awaitNanos(remaining);
+                } catch (InterruptedException error) {
+                    Thread.currentThread().interrupt();
+                    break;
+                }
+            }
+            return latestFrame;
+        } finally {
+            lock.unlock();
+        }
+    }
+
     private FrameData nextFrame(long after) {
         lock.lock();
         try {
@@ -138,18 +162,22 @@ final class BridgeMjpegServer {
             BufferedOutputStream out = new BufferedOutputStream(socket.getOutputStream());
 
             if (path.startsWith("/shot")) {
-                byte[] frame;
-                lock.lock();
-                try { frame = latestFrame; }
-                finally { lock.unlock(); }
-                if (frame == null) {
-                    writeAscii(out, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
-                } else {
-                    writeAscii(out, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: "
-                            + frame.length + "\r\nConnection: close\r\n\r\n");
-                    out.write(frame);
+                // Request one camera frame. This also wakes the ARCore JPEG encoder
+                // when no long-running /video client has connected yet.
+                snapshotRequests.incrementAndGet();
+                try {
+                    byte[] frame = awaitSnapshot(1800);
+                    if (frame == null) {
+                        writeAscii(out, "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+                    } else {
+                        writeAscii(out, "HTTP/1.1 200 OK\r\nContent-Type: image/jpeg\r\nContent-Length: "
+                                + frame.length + "\r\nConnection: close\r\n\r\n");
+                        out.write(frame);
+                    }
+                    out.flush();
+                } finally {
+                    snapshotRequests.decrementAndGet();
                 }
-                out.flush();
                 return;
             }
 
