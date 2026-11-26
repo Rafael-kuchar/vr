@@ -116,11 +116,11 @@ jobs:
 
       - name: Extract Cardboard native library
         working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
-        run: ./gradlew :app:extractNdk --no-daemon
+        run: bash ./gradlew :app:extractNdk --no-daemon
 
       - name: Build ALVR noGvr debug APK
         working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
-        run: ./gradlew :app:assembleNoGvrDebug --no-daemon -x spotlessCheck --stacktrace
+        run: bash ./gradlew :app:assembleNoGvrDebug --no-daemon -x spotlessCheck --stacktrace
 
       - name: Validate hand-tracking script syntax
         run: python3 -m py_compile "pc/hands__66_ (2).py" tools/patch_phonevr.py
