@@ -118,9 +118,27 @@ jobs:
         working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
         run: bash ./gradlew :app:extractNdk --no-daemon
 
+      - name: Discover ALVR noGvr debug task
+        id: find_nogvr_task
+        working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
+        shell: bash
+        run: |
+          set -euo pipefail
+          TASKS="$(bash ./gradlew :app:tasks --all --console=plain --no-daemon)"
+          printf '%s\n' "$TASKS"
+          TASK="$(printf '%s\n' "$TASKS" | awk 'tolower($1) ~ /^assemble.*nogvr.*debug$/ { print $1; exit }')"
+          if [[ -z "$TASK" ]]; then
+            echo '::error::No noGvr debug assemble task exists in this PhoneVR checkout.'
+            echo 'Available assemble tasks:'
+            printf '%s\n' "$TASKS" | awk 'tolower($1) ~ /^assemble/ { print $1 }'
+            exit 1
+          fi
+          echo "Using Gradle task: :app:$TASK"
+          echo "task=$TASK" >> "$GITHUB_OUTPUT"
+
       - name: Build ALVR noGvr debug APK
         working-directory: .upstream/PhoneVR/code/mobile/android/PhoneVR
-        run: bash ./gradlew :app:assembleNoGvrDebug --no-daemon -x spotlessCheck --stacktrace
+        run: bash ./gradlew ":app:${{ steps.find_nogvr_task.outputs.task }}" --no-daemon -x spotlessCheck --stacktrace
 
       - name: Validate hand-tracking script syntax
         run: python3 -m py_compile "pc/hands__66_ (2).py" tools/patch_phonevr.py
@@ -129,7 +147,14 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist/pc
-          cp .upstream/PhoneVR/code/mobile/android/PhoneVR/app/build/outputs/apk/noGvr/debug/app-noGvr-debug.apk dist/VRPhoneBridge-ALVR.apk
+          APK="$(find .upstream/PhoneVR/code/mobile/android/PhoneVR/app/build/outputs/apk -type f -iname '*nogvr*debug*.apk' -print -quit)"
+          if [[ -z "$APK" ]]; then
+            echo '::error::The noGvr debug APK was not found after the build.'
+            find .upstream/PhoneVR/code/mobile/android/PhoneVR/app/build/outputs/apk -maxdepth 4 -type f -print || true
+            exit 1
+          fi
+          echo "Packaging APK: $APK"
+          cp "$APK" dist/VRPhoneBridge-ALVR.apk
           cp "pc/hands__66_ (2).py" pc/hand_landmarker.task pc/requirements.txt pc/start_hands.bat pc/check_phone_camera.bat dist/pc/
           cd dist
           zip -r VRPhoneBridge-PC-hands.zip pc
