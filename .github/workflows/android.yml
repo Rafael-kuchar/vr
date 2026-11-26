@@ -41,7 +41,8 @@ jobs:
       - name: Install Android NDK and build tools
         shell: bash
         run: |
-          yes | sdkmanager --licenses >/dev/null
+          # Process substitution avoids pipefail treating yes's expected SIGPIPE as a failure.
+          sdkmanager --licenses < <(yes)
           sdkmanager \
             "platform-tools" \
             "platforms;android-34" \
